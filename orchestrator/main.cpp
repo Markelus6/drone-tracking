@@ -49,10 +49,10 @@ static DeviceSpec parse_spec(const std::string& spec) {
     return d;
 }
 
-static void print_status_loop(CameraOrchestrator& orch) {
+static void print_status_loop(size_t camera_count) {
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::seconds(10));
-        std::printf("[ORCH] Running — cameras: 2\n");
+        std::printf("[ORCH] Running — cameras: %zu\n", camera_count);
     }
 }
 
@@ -104,7 +104,7 @@ int main(int argc, char** argv) {
     }
     std::printf("[ORCH] Press Ctrl+C to stop\n");
 
-    std::thread status_thread(print_status_loop, std::ref(orch));
+    std::thread status_thread(print_status_loop, devices.size());
     status_thread.detach();
 
     while (g_running) {

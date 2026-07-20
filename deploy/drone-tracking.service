@@ -1,0 +1,21 @@
+[Unit]
+Description=drone-tracking (orch + tracker + stats :8090)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/root/drone-tracking/deploy
+Environment=DRON_PROJECT_DIR=/root/drone-tracking
+Environment=TRACKER=light
+Environment=TRACK_CAMERA=/dev/cam_usb2
+Environment=STATS_WEB_PORT=8090
+Environment=VISION_TELEMETRY_PORT=12345
+ExecStart=/bin/bash /root/drone-tracking/deploy/start_tracking.sh start
+ExecStop=/bin/bash /root/drone-tracking/deploy/start_tracking.sh stop
+TimeoutStartSec=60
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

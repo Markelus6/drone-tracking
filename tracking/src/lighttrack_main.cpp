@@ -353,12 +353,13 @@ button:hover{background:#6f6}
 </style></head><body>
 <h1>LightTrack Manual Capture</h1>
 <div id="wrap">
-  <img id="video" src="http://HOST:5005/" onerror="this.src='data:,'">
+  <img id="video" src="" onerror="this.src='data:,'">
   <canvas id="canvas" width="640" height="480"></canvas>
 </div>
 <div id="status">Draw rectangle around object to track</div>
 <script>
 const img = document.getElementById('video');
+img.src = 'http://' + location.hostname + ':5005/';
 const cvs = document.getElementById('canvas');
 const ctx = cvs.getContext('2d');
 let startX, startY, isDrawing = false;
@@ -445,10 +446,8 @@ cvs.addEventListener('mouseup', e => {
             continue;
         }
 
-        std::string html = page;
-        char host_ip[64] = "192.168.3.152";
-        html.replace(html.find("HOST"), 4, host_ip);
-        std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n" + html;
+        std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
+        resp += page;
         send(cfd, resp.c_str(), resp.size(), 0);
         close(cfd);
     }
@@ -471,6 +470,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--camera" && i + 1 < argc) camera = argv[++i];
         else if (a == "--models" && i + 1 < argc) model_dir = argv[++i];
+        else if (a == "--telem-host" && i + 1 < argc) telem_host = argv[++i];
         else if (a == "--telem-port" && i + 1 < argc) telem_port = std::atoi(argv[++i]);
         else if (a == "--cmd-port" && i + 1 < argc) cmd_port = std::atoi(argv[++i]);
         else if (a == "--cam-name" && i + 1 < argc) cam_name = argv[++i];
@@ -478,6 +478,7 @@ int main(int argc, char** argv) {
     }
     if (const char* e = std::getenv("LIGHTTRACK_MODELS_DIR")) model_dir = e;
     if (const char* e = std::getenv("LIGHTTRACK_CMD_PORT")) cmd_port = std::atoi(e);
+    if (const char* e = std::getenv("VISION_TELEMETRY_HOST")) telem_host = e;
     if (const char* e = std::getenv("VISION_TELEMETRY_PORT")) telem_port = std::atoi(e);
     if (const char* e = std::getenv("LIGHTTRACK_CAM_NAME")) cam_name = e;
     if (const char* e = std::getenv("LIGHTTRACK_VIZ_PORT")) g_mjpeg_port = std::atoi(e);
@@ -488,8 +489,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[LightTrack] model load failed from %s\n", model_dir.c_str());
         return 1;
     }
-    std::printf("[LightTrack] Models OK: %s  cam=%s  telem=:%d  cmd=:%d  viz=:%d  stride=%d\n",
-                model_dir.c_str(), camera.c_str(), telem_port, cmd_port, g_mjpeg_port, frame_stride);
+    std::printf("[LightTrack] Models OK: %s  cam=%s  telem=%s:%d  cmd=:%d  viz=:%d  stride=%d\n",
+                model_dir.c_str(), camera.c_str(), telem_host.c_str(), telem_port, cmd_port, g_mjpeg_port, frame_stride);
 
     const std::string shm = shm_name_from_dev(camera);
     if (!shm_open_persistent(shm)) {
@@ -777,7 +778,14 @@ int main(int argc, char** argv) {
             stat_track_calls = 0;
             stat_track_ms_sum = 0;
             stat_track_ms_max = 0;
-            const char* hb = "{\"tracker\":\"lighttrack\",\"alive\":true}";
+            char hb[384];
+            std::snprintf(hb, sizeof(hb),
+                "{\"tracker\":\"lighttrack\",\"cam\":\"%s\",\"alive\":true,\"tracking\":%s,"
+                "\"fps\":%.1f,\"track_ms_avg\":%.1f,\"track_ms_max\":%.1f,"
+                "\"cx\":%.4f,\"cy\":%.4f,\"h\":%.4f,\"score\":%.3f,\"lost_streak\":%d}",
+                cam_name.c_str(), g_tracking.load() ? "true" : "false",
+                stat_fps, stat_track_ms_avg, stat_track_ms_max_v,
+                smooth_cx, smooth_cy, smooth_h, smooth_score, lost_streak);
             sendto(telem_sock, hb, std::strlen(hb), 0,
                    reinterpret_cast<struct sockaddr*>(&telem_addr), sizeof(telem_addr));
             last_hb = now;
