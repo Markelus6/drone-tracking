@@ -1053,6 +1053,11 @@ def _dashboard_html() -> str:
         ' · track ' + Number(tr.track_ms_avg ?? 0).toFixed(1) + '/' + Number(tr.track_ms_max ?? 0).toFixed(1) + ' ms</small>';
       if (tr.cpu_pct != null) trHtml += '<br/><small>CPU ' + Number(tr.cpu_pct).toFixed(1) +
         '% · RSS ' + Number(tr.rss_mb ?? 0).toFixed(0) + ' MB</small>';
+      if (tr.cmd_port) {{
+        trHtml += '<br/><br/>' +
+          '<button onclick="fetch(\'/cmd?action=init\').then(r=>r.text()).then(console.log).catch(console.error)" style="background:#2d7d46;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px;margin-right:4px">▶ Start</button>' +
+          '<button onclick="fetch(\'/cmd?action=stop\').then(r=>r.text()).then(console.log).catch(console.error)" style="background:#8a2e2e;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px">■ Stop</button>';
+      }}
       document.getElementById('tracker').innerHTML = trHtml;
 
       const bf = s.betaflight || {{}};
@@ -1301,6 +1306,26 @@ def run_server() -> None:
             if path in ("/health", "/healthz"):
                 body = b'{"ok":true}\n'
                 return self._send(200, "application/json; charset=utf-8", body)
+            if path == "/cmd":
+                action = (qs.get("action") or [""])[0]
+                if action not in ("init", "stop"):
+                    return self._send(400, "text/plain; charset=utf-8", b"bad action\n")
+                ts = _tracker_snapshot(time.time())
+                port = ts.get("cmd_port")
+                if not port:
+                    return self._send(503, "text/plain; charset=utf-8", b"no cmd_port\n")
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.settimeout(1.0)
+                    if action == "init":
+                        payload = b'{"cmd":"init","bbox_norm":[0.5,0.5,0.2,0.2]}'
+                    else:
+                        payload = b'{"cmd":"stop"}'
+                    sock.sendto(payload, ("127.0.0.1", port))
+                    sock.close()
+                    return self._send(200, "text/plain; charset=utf-8", b"ok\n")
+                except OSError as e:
+                    return self._send(500, "text/plain; charset=utf-8", f"send failed: {e}\n".encode())
             return self._send(404, "text/plain; charset=utf-8", b"Not found\n")
 
     class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
