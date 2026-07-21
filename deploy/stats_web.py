@@ -1055,8 +1055,8 @@ def _dashboard_html() -> str:
         '% · RSS ' + Number(tr.rss_mb ?? 0).toFixed(0) + ' MB</small>';
       if (tr.cmd_port) {{
         trHtml += '<br/><br/>' +
-          '<button onclick="fetch(\'/cmd?action=init\').then(r=>r.text()).then(console.log).catch(console.error)" style="background:#2d7d46;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px;margin-right:4px">▶ Start</button>' +
-          '<button onclick="fetch(\'/cmd?action=stop\').then(r=>r.text()).then(console.log).catch(console.error)" style="background:#8a2e2e;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px">■ Stop</button>';
+          '<button onclick="fetch(&quot;/cmd?action=init&quot;).then(r=&gt;r.text()).then(console.log).catch(console.error)" style="background:#2d7d46;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px;margin-right:4px">▶ Start</button>' +
+          '<button onclick="fetch(&quot;/cmd?action=stop&quot;).then(r=&gt;r.text()).then(console.log).catch(console.error)" style="background:#8a2e2e;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px">■ Stop</button>';
       }}
       document.getElementById('tracker').innerHTML = trHtml;
 
