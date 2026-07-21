@@ -5,35 +5,75 @@
 #include <cmath>
 #include <cstdio>
 #include <algorithm>
+#include <thread>
+
+
+#ifdef __linux__
+#include <sched.h>
+#include <unistd.h>
+#endif
 
 struct LightTrack::Impl {
     ncnn::Net init_net, update_net;
     ncnn::Mat zf;
 };
 
+// NCNN optimization level — applied once to all net instances.
+// Override via env vars: NCNN_THREADS, NCNN_FP16=0, NCNN_PACK=0, NCNN_WINO=0, NCNN_SGEMM=0
+static void setup_ncnn_opt(ncnn::Net& net) {
+    int threads = std::min(4, (int)std::thread::hardware_concurrency());
+    bool fp16 = true, pack = true, bf16 = true, winograd = true, sgemm = true;
+    if (const char* e = std::getenv("NCNN_THREADS")) threads = std::max(1, std::atoi(e));
+    if (const char* e = std::getenv("NCNN_FP16"))   if (!std::atoi(e)) { fp16 = false; bf16 = false; }
+    if (const char* e = std::getenv("NCNN_PACK"))   pack = std::atoi(e) != 0;
+    if (const char* e = std::getenv("NCNN_WINO"))   winograd = std::atoi(e) != 0;
+    if (const char* e = std::getenv("NCNN_SGEMM"))  sgemm = std::atoi(e) != 0;
+    net.opt.num_threads = threads;
+    net.opt.use_packing_layout = pack;
+    net.opt.use_fp16_storage = fp16;
+    net.opt.use_fp16_arithmetic = fp16;
+    net.opt.use_bf16_storage = bf16;
+    net.opt.use_vulkan_compute = false;
+    net.opt.use_winograd_convolution = winograd;
+    net.opt.use_sgemm_convolution = sgemm;
+    net.opt.use_int8_inference = false;
+}
+
+// Pin current thread to RK3588 big cores (4-7) if available
+static void pin_big_cores() {
+#ifdef __linux__
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    for (int i = 4; i < 8; i++) CPU_SET(i, &mask);
+    if (sched_setaffinity(0, sizeof(mask), &mask) != 0) {
+        CPU_ZERO(&mask);
+        for (int i = 0; i < 8; i++) CPU_SET(i, &mask);
+        sched_setaffinity(0, sizeof(mask), &mask);
+    }
+#endif
+}
+
+// Pre-computed normalization constants
+static constexpr float MEAN_R = 0.406f * 255.0f;
+static constexpr float MEAN_G = 0.456f * 255.0f;
+static constexpr float MEAN_B = 0.485f * 255.0f;
+static constexpr float NORM_R = 1.0f / (0.225f * 255.0f);
+static constexpr float NORM_G = 1.0f / (0.224f * 255.0f);
+static constexpr float NORM_B = 1.0f / (0.229f * 255.0f);
+static const float MEAN_VALS[3] = {MEAN_B, MEAN_G, MEAN_R};
+static const float NORM_VALS[3] = {NORM_B, NORM_G, NORM_R};
+
 static float fast_sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
-static float sz_whFun(cv::Point2f wh) { float pad = (wh.x + wh.y) * 0.5f; return std::sqrt((wh.x + pad) * (wh.y + pad)); }
-
-static std::vector<float> sz_change_fun(const std::vector<float>& w, const std::vector<float>& h, float sz) {
-    int n = (int)w.size();
-    std::vector<float> pad(n), out(n);
-    for (int i = 0; i < n; i++) pad[i] = (w[i] + h[i]) * 0.5f;
-    for (int i = 0; i < n; i++) { float t = std::sqrt((w[i] + pad[i]) * (h[i] + pad[i])) / sz; out[i] = std::max(t, 1.0f / t); }
-    return out;
-}
-
-static std::vector<float> ratio_change_fun(const std::vector<float>& w, const std::vector<float>& h, cv::Point2f tsz) {
-    int n = (int)w.size();
-    float ratio = tsz.x / (tsz.y + 1e-8f);
-    std::vector<float> out(n);
-    for (int i = 0; i < n; i++) { float t = ratio / (w[i] / (h[i] + 1e-8f) + 1e-8f); out[i] = std::max(t, 1.0f / t); }
-    return out;
-}
 
 LightTrack::~LightTrack() { release(); }
 
 bool LightTrack::load_models(const std::string& model_dir) {
     impl_ = new Impl();
+
+    pin_big_cores();
+    setup_ncnn_opt(impl_->init_net);
+    setup_ncnn_opt(impl_->update_net);
+
     std::string ip = model_dir + "/lighttrack_init.param";
     std::string ib = model_dir + "/lighttrack_init.bin";
     std::string up = model_dir + "/lighttrack_update.param";
@@ -44,7 +84,11 @@ bool LightTrack::load_models(const std::string& model_dir) {
     if (impl_->update_net.load_model(ub.c_str()) != 0) { fprintf(stderr, "[LightTrack/ncnn] update bin fail\n"); return false; }
     create_grids();
     create_window();
-    fprintf(stderr, "[LightTrack/ncnn] Models OK: %s score_sz=%d\n", model_dir.c_str(), score_sz_);
+    fprintf(stderr, "[LightTrack/ncnn] Models OK: %s score_sz=%d threads=%d fp16=%d pack=%d\n",
+            model_dir.c_str(), score_sz_,
+            impl_->update_net.opt.num_threads,
+            impl_->update_net.opt.use_fp16_arithmetic,
+            impl_->update_net.opt.use_packing_layout);
     return true;
 }
 
@@ -113,11 +157,8 @@ void LightTrack::init(const cv::Mat& img, const cv::Rect& bbox) {
     cv::Scalar avg = cv::mean(img);
     cv::Mat z_crop = get_subwindow_tracking(img, cv::Point2f(tp), cfg.exemplar_size, (int)s_z, avg);
 
-    // ImageNet normalization: mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]
-    float mean_vals[3] = {0.406f * 255.0f, 0.456f * 255.0f, 0.485f * 255.0f};
-    float norm_vals[3] = {1.0f / (0.225f * 255.0f), 1.0f / (0.224f * 255.0f), 1.0f / (0.229f * 255.0f)};
     ncnn::Mat in = ncnn::Mat::from_pixels(z_crop.data, ncnn::Mat::PIXEL_BGR2RGB, z_crop.cols, z_crop.rows);
-    in.substract_mean_normalize(mean_vals, norm_vals);
+    in.substract_mean_normalize(MEAN_VALS, NORM_VALS);
 
     ncnn::Extractor ex = impl_->init_net.create_extractor();
     ex.input("input1", in);
@@ -139,11 +180,8 @@ void LightTrack::init(const cv::Mat& img, const cv::Rect& bbox) {
 void LightTrack::update(const cv::Mat& x_crop, cv::Point& tp, cv::Point2f& tsz, float scale_z, float& cls_score_max) {
     if (!impl_) return;
 
-    // ImageNet normalization
-    float mean_vals[3] = {0.406f * 255.0f, 0.456f * 255.0f, 0.485f * 255.0f};
-    float norm_vals[3] = {1.0f / (0.225f * 255.0f), 1.0f / (0.224f * 255.0f), 1.0f / (0.229f * 255.0f)};
     ncnn::Mat in = ncnn::Mat::from_pixels(x_crop.data, ncnn::Mat::PIXEL_BGR2RGB, x_crop.cols, x_crop.rows);
-    in.substract_mean_normalize(mean_vals, norm_vals);
+    in.substract_mean_normalize(MEAN_VALS, NORM_VALS);
 
     ncnn::Mat cls_out, bbox_out;
     { ncnn::Extractor ex = impl_->update_net.create_extractor();
@@ -154,64 +192,56 @@ void LightTrack::update(const cv::Mat& x_crop, cv::Point& tp, cv::Point2f& tsz, 
 
     const int plane = score_sz_ * score_sz_;
     std::vector<float> cls_sigmoid(plane);
-    for (int i = 0; i < plane; i++) cls_sigmoid[i] = fast_sigmoid(cls_out[i]);
-
-    std::vector<float> px1(plane), py1(plane), px2(plane), py2(plane);
-    for (int i = 0; i < plane; i++) {
-        px1[i] = grid_to_search_x[i] - bbox_out[0 * plane + i];
-        py1[i] = grid_to_search_y[i] - bbox_out[1 * plane + i];
-        px2[i] = grid_to_search_x[i] + bbox_out[2 * plane + i];
-        py2[i] = grid_to_search_y[i] + bbox_out[3 * plane + i];
-    }
-
     std::vector<float> pw(plane), ph(plane);
-    for (int i = 0; i < plane; i++) { pw[i] = px2[i] - px1[i]; ph[i] = py2[i] - py1[i]; }
-
-    float sz_wh = sz_whFun(tsz);
-    auto s_c = sz_change_fun(pw, ph, sz_wh);
-    auto r_c = ratio_change_fun(pw, ph, tsz);
     std::vector<float> penalty(plane);
-    for (int i = 0; i < plane; i++) penalty[i] = std::exp(-1.0f * (s_c[i] * r_c[i] - 1.0f) * cfg.penalty_k);
+    float maxScore = 0, secondScore = 0;
+    int best_idx = 0;
 
-    int r_max = 0, c_max = 0;
-    float maxScore = 0;
-    float secondScore = 0;
-    std::vector<float> pscore(plane);
+    float sz_target = std::sqrt((tsz.x + (tsz.x + tsz.y) * 0.5f) * (tsz.y + (tsz.x + tsz.y) * 0.5f));
+    float ratio_target = tsz.x / (tsz.y + 1e-8f);
+
     for (int i = 0; i < plane; i++) {
-        pscore[i] = (penalty[i] * cls_sigmoid[i]) * (1.0f - cfg.window_influence) + window[i] * cfg.window_influence;
-        if (pscore[i] > maxScore) {
-            secondScore = maxScore;
-            maxScore = pscore[i];
-            r_max = i / score_sz_;
-            c_max = i - r_max * score_sz_;
-        } else if (pscore[i] > secondScore) {
-            secondScore = pscore[i];
-        }
+        cls_sigmoid[i] = fast_sigmoid(cls_out[i]);
+        float gx = grid_to_search_x[i], gy = grid_to_search_y[i];
+        float x1 = gx - bbox_out[i];
+        float y1 = gy - bbox_out[1 * plane + i];
+        float x2 = gx + bbox_out[2 * plane + i];
+        float y2 = gy + bbox_out[3 * plane + i];
+        float w = x2 - x1, h = y2 - y1;
+        pw[i] = w; ph[i] = h;
+        float pad = (w + h) * 0.5f;
+        float sz_norm = std::sqrt((w + pad) * (h + pad)) / sz_target;
+        if (sz_norm < 1.0f) sz_norm = 1.0f / sz_norm;
+        float r = ratio_target / (w / (h + 1e-8f) + 1e-8f);
+        if (r < 1.0f) r = 1.0f / r;
+        penalty[i] = std::exp((1.0f - sz_norm * r) * cfg.penalty_k);
     }
 
-    int best = r_max * score_sz_ + c_max;
+    const float wi = cfg.window_influence;
+    const float one_m_wi = 1.0f - wi;
+    for (int i = 0; i < plane; i++) {
+        float ps = (penalty[i] * cls_sigmoid[i]) * one_m_wi + window[i] * wi;
+        if (ps > maxScore) { secondScore = maxScore; maxScore = ps; best_idx = i; }
+        else if (ps > secondScore) { secondScore = ps; }
+    }
+
     float cls_mean = 0.0f;
-    for (float value : cls_sigmoid) cls_mean += value;
-    cls_mean /= std::max(1, plane);
+    for (float v : cls_sigmoid) cls_mean += v;
+    cls_mean /= (float)plane;
     float cls_var = 0.0f;
-    for (float value : cls_sigmoid) {
-        const float delta = value - cls_mean;
-        cls_var += delta * delta;
-    }
-    cls_var /= std::max(1, plane);
-    const float psr = (cls_sigmoid[best] - cls_mean) / (std::sqrt(cls_var) + 1e-6f);
-    const float response_quality = std::clamp((psr - 1.5f) / 5.0f, 0.0f, 1.0f);
-    const float raw_score = cls_sigmoid[best];
-    const float peak_margin = maxScore - secondScore;
-    float effective_score = raw_score * (0.55f + 0.45f * response_quality);
-    if (peak_margin < cfg.min_peak_margin) {
-        effective_score *= 0.85f;
-    }
+    for (float v : cls_sigmoid) { float d = v - cls_mean; cls_var += d * d; }
+    cls_var /= (float)plane;
+    float psr = (cls_sigmoid[best_idx] - cls_mean) / (std::sqrt(cls_var) + 1e-6f);
+    float raw_score = cls_sigmoid[best_idx];
+    float peak_margin = maxScore - secondScore;
+    float effective_score = raw_score * (0.55f + 0.45f * std::clamp((psr - 1.5f) / 5.0f, 0.0f, 1.0f));
+    if (peak_margin < cfg.min_peak_margin) effective_score *= 0.85f;
 
-    float pred_xs = (px1[best] + px2[best]) / 2.0f;
-    float pred_ys = (py1[best] + py2[best]) / 2.0f;
-    float pred_w = px2[best] - px1[best];
-    float pred_h = py2[best] - py1[best];
+    float gxb = grid_to_search_x[best_idx], gyb = grid_to_search_y[best_idx];
+    float pred_xs = (gxb - bbox_out[best_idx] + gxb + bbox_out[2 * plane + best_idx]) * 0.5f;
+    float pred_ys = (gyb - bbox_out[1 * plane + best_idx] + gyb + bbox_out[3 * plane + best_idx]) * 0.5f;
+    float pred_w = pw[best_idx];
+    float pred_h = ph[best_idx];
 
     float diff_xs = (pred_xs - cfg.instance_size / 2.0f) / scale_z;
     float diff_ys = (pred_ys - cfg.instance_size / 2.0f) / scale_z;
@@ -220,7 +250,7 @@ void LightTrack::update(const cv::Mat& x_crop, cv::Point& tp, cv::Point2f& tsz, 
     tsz.x /= scale_z;
     tsz.y /= scale_z;
 
-    float lr = penalty[best] * cls_sigmoid[best] * cfg.lr;
+    float lr = penalty[best_idx] * cls_sigmoid[best_idx] * cfg.lr;
 
     float raw_cx = tp.x + diff_xs;
     float raw_cy = tp.y + diff_ys;

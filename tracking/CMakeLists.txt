@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.10)
 project(tracking_fc)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8.2-a+fp16+dotprod -ffast-math")
+endif()
 
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
@@ -54,17 +57,3 @@ add_executable(multitrack_fc
   ${ORCH_DIR}/camera_orchestrator.cpp
 )
 target_link_libraries(multitrack_fc ${COMMON_LIBS})
-
-# Unified benchmark binary: runs all trackers on a dataset (no SHM needed)
-add_executable(benchmark_fc
-  src/benchmark_main.cpp
-  src/tracker_benchmark.cpp
-  src/tracker_factory.cpp
-  src/opencv_legacy_tracker.cpp
-  src/opencv_modern_tracker.cpp
-  src/cf_ensemble_tracker.cpp
-  src/nanotrack.cpp
-  src/nanotrack_onnx.cpp
-  src/lighttrack.cpp
-)
-target_link_libraries(benchmark_fc ${COMMON_LIBS})
