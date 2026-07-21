@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <fcntl.h>
 #include <mutex>
 #include <string>
@@ -40,6 +41,11 @@ static void on_sig(int) { g_running = false; }
 static int lost_frames_threshold() {
     if (const char* e = std::getenv("NANOTRACK_LOST_FRAMES")) return std::max(1, std::atoi(e));
     return 45;
+}
+
+static float lost_score_threshold() {
+    if (const char* e = std::getenv("NANOTRACK_LOST_SCORE")) return std::max(0.01f, (float)std::atof(e));
+    return 0.10f;
 }
 
 static std::string shm_name_from_dev(const std::string& dev) {
@@ -117,18 +123,67 @@ static bool mjpeg_send_all(int fd, const char* data, size_t len) {
 
 static void mjpeg_handle_client(int client_sock) {
     g_mjpeg_clients.fetch_add(1, std::memory_order_relaxed);
+
+    // Snapshot endpoint — reliable in every browser (multipart <img> often flakes).
+    char req[512];
+    ssize_t rn = recv(client_sock, req, sizeof(req) - 1, MSG_PEEK);
+    if (rn > 0) {
+        req[rn] = '\0';
+        if (strstr(req, "GET /snap") || strstr(req, "GET /frame.jpg")) {
+            recv(client_sock, req, sizeof(req) - 1, 0);  // drain request
+            std::vector<uchar> jpeg;
+            for (int i = 0; i < 50 && jpeg.empty(); ++i) {
+                { std::lock_guard<std::mutex> lk(g_mjpeg_mtx); jpeg = g_mjpeg_jpeg; }
+                if (jpeg.empty()) usleep(20000);
+            }
+            if (jpeg.empty()) {
+                const char* miss =
+                    "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\nno frame\n";
+                mjpeg_send_all(client_sock, miss, strlen(miss));
+            } else {
+                char hdr[160];
+                int n = snprintf(hdr, sizeof(hdr),
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n"
+                    "Cache-Control: no-cache, no-store\r\nContent-Length: %zu\r\n"
+                    "Connection: close\r\n\r\n", jpeg.size());
+                mjpeg_send_all(client_sock, hdr, n);
+                mjpeg_send_all(client_sock, reinterpret_cast<const char*>(jpeg.data()), jpeg.size());
+            }
+            close(client_sock);
+            g_mjpeg_clients.fetch_sub(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+
     const char* hdr =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
         "Cache-Control: no-cache, no-store\r\n"
         "Pragma: no-cache\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
         "Connection: close\r\n\r\n";
     if (!mjpeg_send_all(client_sock, hdr, strlen(hdr))) {
         close(client_sock);
         g_mjpeg_clients.fetch_sub(1, std::memory_order_relaxed);
         return;
     }
-    uint64_t last_seq = 0;
+    // Push current frame immediately if available (don't wait for next seq).
+    {
+        std::vector<uchar> jpeg;
+        { std::lock_guard<std::mutex> lk(g_mjpeg_mtx); jpeg = g_mjpeg_jpeg; }
+        if (!jpeg.empty()) {
+            char part[128];
+            int n = snprintf(part, sizeof(part),
+                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n", jpeg.size());
+            if (!mjpeg_send_all(client_sock, part, n) ||
+                !mjpeg_send_all(client_sock, reinterpret_cast<const char*>(jpeg.data()), jpeg.size())) {
+                close(client_sock);
+                g_mjpeg_clients.fetch_sub(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+    }
+    uint64_t last_seq = g_mjpeg_seq.load(std::memory_order_acquire);
     while (g_running) {
         uint64_t cur = g_mjpeg_seq.load(std::memory_order_acquire);
         if (cur == last_seq) { usleep(5000); continue; }
@@ -182,18 +237,35 @@ static void mjpeg_accept_thread() {
 static std::mutex g_viz_mtx;
 static cv::Mat g_viz_frame;
 static std::atomic<bool> g_viz_new{false};
+static int g_stream_max_w = 480;  // preview width; tracker stays full-res
+
+static int env_int(const char* a, const char* b, int defv, int lo, int hi) {
+    if (const char* e = std::getenv(a)) return std::max(lo, std::min(hi, std::atoi(e)));
+    if (b) if (const char* e = std::getenv(b)) return std::max(lo, std::min(hi, std::atoi(e)));
+    return defv;
+}
 
 static void mjpeg_encoder_thread() {
+    const int period_ms = env_int("NANOTRACK_MJPEG_PERIOD_MS", "VISION_MJPEG_PERIOD_MS", 33, 16, 200);
+    const int jpeg_q = env_int("NANOTRACK_MJPEG_QUALITY", "VISION_MJPEG_QUALITY", 40, 20, 95);
+    using clock = std::chrono::steady_clock;
+    auto last_encode = clock::now();
+    std::fprintf(stderr, "[NanoTrack] MJPEG encode period=%dms q=%d stream_max_w=%d\n",
+                 period_ms, jpeg_q, g_stream_max_w);
     while (g_running) {
-        if (!g_viz_new.load(std::memory_order_acquire)) { usleep(2000); continue; }
+        if (!g_viz_new.load(std::memory_order_acquire)) { usleep(1000); continue; }
+        auto now = clock::now();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_encode).count();
+        if (elapsed < period_ms) { usleep(1000); continue; }
         cv::Mat local;
-        { std::lock_guard<std::mutex> lk(g_viz_mtx); local = g_viz_frame.clone(); g_viz_new.store(false); }
+        { std::lock_guard<std::mutex> lk(g_viz_mtx); local = std::move(g_viz_frame); g_viz_new.store(false); }
         if (local.empty()) continue;
         std::vector<uchar> buf;
-        std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 50};
+        std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, jpeg_q};
         cv::imencode(".jpg", local, buf, params);
         { std::lock_guard<std::mutex> lk(g_mjpeg_mtx); g_mjpeg_jpeg = std::move(buf); }
         g_mjpeg_seq.fetch_add(1, std::memory_order_release);
+        last_encode = clock::now();
     }
 }
 
@@ -341,7 +413,7 @@ static void manual_capture_thread() {
 body{background:#111;color:#0f0;font-family:monospace;display:flex;flex-direction:column;align-items:center;gap:8px;padding:8px}
 h1{font-size:16px}
 #wrap{position:relative;display:inline-block;border:1px solid #0f0}
-#wrap img{display:block;width:100%}
+#wrap img,#wrap object{display:block;width:100%;min-height:240px;background:#222}
 #wrap canvas{position:absolute;top:0;left:0;width:100%;height:100%;cursor:crosshair}
 #status{font-size:12px;color:#0f0}
 button{background:#0f0;color:#111;border:none;padding:6px 16px;font-size:13px;font-weight:bold;border-radius:4px;cursor:pointer;font-family:inherit}
@@ -349,18 +421,64 @@ button:hover{background:#6f6}
 </style></head><body>
 <h1>NanoTrack Manual Capture</h1>
 <div id="wrap">
-  <img id="video" src="" onerror="this.src='data:,'">
+  <img id="video" alt="stream">
   <canvas id="canvas" width="640" height="480"></canvas>
 </div>
 <div id="status">Draw rectangle around object to track</div>
 <script>
+const streamUrl = 'http://' + location.hostname + ':5003/';
+const snapUrl = streamUrl + 'snap.jpg';
 const img = document.getElementById('video');
-img.src = 'http://' + location.hostname + ':5003/';
 const cvs = document.getElementById('canvas');
 const ctx = cvs.getContext('2d');
 let startX, startY, isDrawing = false;
+let useSnap = false;
+let lastSnap = 0;
 
-img.onload = () => { cvs.width = img.naturalWidth || 640; cvs.height = img.naturalHeight || 480; };
+function setStatus(t) { document.getElementById('status').textContent = t; }
+
+function onFrame() {
+  if (img.naturalWidth > 0) {
+    cvs.width = img.naturalWidth;
+    cvs.height = img.naturalHeight;
+  }
+}
+
+function connectMjpeg() {
+  useSnap = false;
+  img.onload = () => { onFrame(); setStatus('Stream OK (MJPEG) — draw a box to track'); };
+  img.onerror = () => {
+    setStatus('MJPEG failed — switching to snapshot poll');
+    useSnap = true;
+  };
+  img.src = streamUrl + '?t=' + Date.now();
+}
+
+function pollSnap() {
+  if (!useSnap) return;
+  const t = Date.now();
+  if (t - lastSnap < 80) return;
+  lastSnap = t;
+  const probe = new Image();
+  probe.onload = () => {
+    img.src = probe.src;
+    onFrame();
+    setStatus('Stream OK (snap) — draw a box to track');
+  };
+  probe.onerror = () => setStatus('Waiting for camera…');
+  probe.src = snapUrl + '?t=' + t;
+}
+
+connectMjpeg();
+setInterval(() => {
+  if (useSnap || !img.complete || img.naturalWidth === 0) {
+    if (!useSnap && (!img.complete || img.naturalWidth === 0)) useSnap = true;
+    pollSnap();
+  }
+}, 100);
+setTimeout(() => {
+  if (!img.naturalWidth) { useSnap = true; setStatus('Fallback to snap poll…'); }
+}, 1500);
 
 cvs.addEventListener('mousedown', e => {
     const r = cvs.getBoundingClientRect();
@@ -390,6 +508,12 @@ cvs.addEventListener('mouseup', e => {
     const cy = ((startY + ey) / 2) / cvs.height;
     const w = Math.abs(ex - startX) / cvs.width;
     const h = Math.abs(ey - startY) / cvs.height;
+    if (w < 0.03 || h < 0.03) {
+        document.getElementById('status').textContent =
+            'Draw a box (click-drag), not a click';
+        ctx.clearRect(0, 0, cvs.width, cvs.height);
+        return;
+    }
     document.getElementById('status').textContent =
         'Sending: cx=' + cx.toFixed(3) + ' cy=' + cy.toFixed(3) +
         ' w=' + w.toFixed(3) + ' h=' + h.toFixed(3);
@@ -418,7 +542,8 @@ cvs.addEventListener('mouseup', e => {
             const char* p = strstr(req, "cx=");
             float cx = 0.5f, cy = 0.5f, w = 0.2f, h = 0.2f;
             if (p) std::sscanf(p, "cx=%f&cy=%f&w=%f&h=%f", &cx, &cy, &w, &h);
-            if (w < 0.01f) w = h;
+            if (w < 0.03f) w = 0.08f;
+            if (h < 0.03f) h = 0.08f;
 
             // Send to NanoTrack via UDP (cmd_thread parses plain strings)
             int cmd_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -485,6 +610,7 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("NANOTRACK_CAM_NAME")) cam_name = e;
     if (const char* e = std::getenv("NANOTRACK_VIZ_PORT")) g_mjpeg_port = std::atoi(e);
     if (const char* e = std::getenv("NANOTRACK_FRAME_STRIDE")) frame_stride = std::max(1, std::atoi(e));
+    g_stream_max_w = env_int("NANOTRACK_STREAM_MAX_W", "VISION_STREAM_MAX_W", 480, 0, 1920);
 
     NanoTrack tracker;
     if (!tracker.load_models(model_dir)) {
@@ -594,9 +720,9 @@ int main(int argc, char** argv) {
                         static_cast<int>(g_init_cy * h - bh * 0.5f),
                         static_cast<int>(bw), static_cast<int>(bh));
             bb &= cv::Rect(0, 0, w, h);
-            if (bb.width < 16 || bb.height < 16) {
+            if (bb.width < 24 || bb.height < 24) {
                 g_tracking = false;
-                std::fprintf(stderr, "[NanoTrack] init rejected: bbox too small\n");
+                std::fprintf(stderr, "[NanoTrack] init rejected: bbox too small (%dx%d)\n", bb.width, bb.height);
                 continue;
             }
             tracker.init(frame, bb);
@@ -612,21 +738,26 @@ int main(int argc, char** argv) {
                 anchor_cy = g_init_cy;
                 anchor_h = nh;
                 anchor_set = true;
+                smooth_cx = g_init_cx;
+                smooth_cy = g_init_cy;
+                smooth_h = nh;
+                smooth_score = 1.0f;
+                smooth_init = true;
                 const int hold_ms = []() {
                     if (const char* e = std::getenv("NANOTRACK_HOLD_MS")) return std::max(0, std::atoi(e));
-                    return 0;
+                    return 200;  // settle template before following
                 }();
                 init_hold_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(hold_ms);
-                continue;
+                reacq_h = 0;
+                // Fall through so MJPEG keeps updating during hold.
             } else {
                 g_tracking = false;
                 std::fprintf(stderr, "[NanoTrack] init failed %d,%d %dx%d\n", bb.x, bb.y, bb.width, bb.height);
             }
         }
 
-        // A tracker cannot validate its own re-acquisition after drifting. Keep
-        // the last output alive, but wait for an external/manual validated init
-        // instead of rebuilding the template from a potentially wrong patch.
+        // After LOST keep last telem alive, but never skip the MJPEG path below
+        // (previous continue froze the stream — looked like a hang after capture).
         if (!g_tracking && reacq_h > 0.01f && should_track) {
             if (reacq_cx > 0.001f && reacq_cy > 0.001f) {
                 char hold[320];
@@ -637,13 +768,9 @@ int main(int argc, char** argv) {
                 sendto(telem_sock, hold, std::strlen(hold), 0,
                        reinterpret_cast<struct sockaddr*>(&telem_addr), sizeof(telem_addr));
             }
-            continue;
-        }
-
-        if (should_track && g_tracking && tracker.is_initialized()) {
+        } else if (should_track && g_tracking && tracker.is_initialized()) {
             const auto now_tr = std::chrono::steady_clock::now();
-            if (now_tr < init_hold_until) continue;
-
+            if (now_tr >= init_hold_until) {
             auto t0 = std::chrono::steady_clock::now();
             tracker.track(frame);
             auto t1 = std::chrono::steady_clock::now();
@@ -656,10 +783,15 @@ int main(int argc, char** argv) {
             float cy = tracker.state.target_pos.y / static_cast<float>(frame.rows);
             const float th = tracker.state.target_sz.y / static_cast<float>(frame.rows);
             const float sc = tracker.state.cls_score_max;
+            const float peak_margin = tracker.state.peak_margin;
+            const float lost_sc = lost_score_threshold();
+            const int lost_n = lost_frames_threshold();
+            // LOST only on sustained low score — peak_margin alone is too noisy on small targets.
+            const bool weak = (sc < lost_sc);
 
-            if (sc < 0.03f) {
+            if (weak) {
                 lost_streak++;
-                if (lost_streak >= 60) {
+                if (lost_streak >= lost_n) {
                     reacq_cx = smooth_cx > 0.001f ? smooth_cx : cx;
                     reacq_cy = smooth_cy > 0.001f ? smooth_cy : cy;
                     reacq_h = smooth_h > 0.01f ? smooth_h : th;
@@ -667,23 +799,33 @@ int main(int argc, char** argv) {
                     g_tracking = false;
                     smooth_init = false;
                     lost_streak = 0;
-                    fprintf(stderr, "[NanoTrack] LOST: sustained score=%.3f; waiting for validated init at cx=%.3f cy=%.3f h=%.3f\n",
-                            sc, reacq_cx, reacq_cy, reacq_h);
+                    fprintf(stderr,
+                            "[NanoTrack] LOST: score=%.3f margin=%.3f; waiting for validated init at cx=%.3f cy=%.3f h=%.3f\n",
+                            sc, peak_margin, reacq_cx, reacq_cy, reacq_h);
                     char msg[128];
                     std::snprintf(msg, sizeof(msg), "{\"cam\":\"%s\",\"tracker\":\"nanotrack\",\"lost\":true}", cam_name.c_str());
                     sendto(telem_sock, msg, std::strlen(msg), 0, reinterpret_cast<struct sockaddr*>(&telem_addr), sizeof(telem_addr));
-                    continue;
+                } else if (smooth_init) {
+                    // Hold last good box — do not publish drifting weak peaks.
+                    cx = smooth_cx;
+                    cy = smooth_cy;
                 }
             } else {
-                lost_streak = std::max(0, lost_streak - 2);
+                lost_streak = std::max(0, lost_streak - 3);
             }
 
-            const float output_motion = smooth_init
-                ? std::hypot(cx - smooth_cx, cy - smooth_cy)
-                : 0.0f;
-            // Keep mild filtering while stationary, but do not add visible lag
-            // when the target starts moving.
-            const float alpha = output_motion > 0.01f ? 0.85f : 0.55f;
+            if (g_tracking) {
+            // Confidence-gated output EMA: weak frames barely move the published box.
+            float alpha = 0.15f;
+            if (sc >= 0.45f) {
+                const float output_motion = smooth_init
+                    ? std::hypot(cx - smooth_cx, cy - smooth_cy) : 0.0f;
+                alpha = output_motion > 0.02f ? 0.70f : 0.45f;
+            } else if (sc >= 0.30f) {
+                alpha = 0.30f;
+            } else if (weak) {
+                alpha = 0.0f;
+            }
             if (smooth_init) {
                 smooth_cx = smooth_cx * (1.0f - alpha) + cx * alpha;
                 smooth_cy = smooth_cy * (1.0f - alpha) + cy * alpha;
@@ -694,54 +836,63 @@ int main(int argc, char** argv) {
             cx = smooth_cx;
             cy = smooth_cy;
 
+            // Slow size adaptation — no hard freeze (freeze caused scale mismatch).
             float out_h = th;
             if (anchor_set && anchor_h > 0.01f) {
-                out_h = std::max(th, anchor_h * 0.65f);
+                out_h = std::clamp(th, anchor_h * 0.55f, anchor_h * 2.2f);
+            }
+            if (!weak && sc >= 0.30f) {
+                if (smooth_h > 0.01f) smooth_h = smooth_h * 0.88f + out_h * 0.12f;
+                else smooth_h = out_h;
+            } else if (smooth_h <= 0.01f) {
+                smooth_h = out_h > 0.01f ? out_h : anchor_h;
             }
 
-            if (!size_frozen) {
-                stable_frames++;
-                if (stable_frames > 15) {
-                    size_frozen = true;
-                    frozen_h = out_h > 0.01f ? out_h : anchor_h;
-                }
-            }
-
-            smooth_score = sc;
+            smooth_score = weak ? smooth_score * 0.9f + sc * 0.1f : sc;
             smooth_init = true;
-            if (!size_frozen) smooth_h = out_h; else smooth_h = frozen_h;
+            size_frozen = false;
 
+            // Only broadcast confident / held boxes (not raw distractor jumps).
+            const float pub_conf = weak ? std::min(sc, 0.20f) : sc;
             char msg[320];
             std::snprintf(msg, sizeof(msg),
                 "{\"cam\":\"%s\",\"tracker\":\"nanotrack\",\"bbox_norm\":[%.4f,%.4f,0,%.4f],"
-                "\"class_id\":0,\"conf\":%.3f}",
-                cam_name.c_str(), cx, cy, smooth_h, sc);
+                "\"class_id\":0,\"conf\":%.3f,\"peak_margin\":%.3f}",
+                cam_name.c_str(), cx, cy, smooth_h, pub_conf, peak_margin);
             sendto(telem_sock, msg, std::strlen(msg), 0,
                    reinterpret_cast<struct sockaddr*>(&telem_addr), sizeof(telem_addr));
+            } // g_tracking
+            } // init_hold done
         }
 
+        // Always publish preview frames (even with 0 clients) so the first
+        // browser connect gets a live JPEG immediately instead of a blank hang.
         {
-            extern std::atomic<int> g_mjpeg_clients;
-            if (g_mjpeg_clients.load() > 0) {
-                cv::Mat viz = frame.clone();
-                if (g_tracking.load() && smooth_init) {
-                    draw_grid(viz, smooth_cx, smooth_cy, smooth_h, smooth_score);
-                    draw_tracking(viz, smooth_cx, smooth_cy, smooth_h, smooth_score);
-                } else {
-                    draw_grid(viz);
-                }
-                // Stats overlay
-                char st[128];
-                snprintf(st, sizeof(st), "FPS:%.0f  track:%.1fms avg %.1fmax",
-                         stat_fps, stat_track_ms_avg, stat_track_ms_max_v);
-                int baseline = 0;
-                cv::Size sz = cv::getTextSize(st, cv::FONT_HERSHEY_SIMPLEX, 0.45, 1, &baseline);
-                cv::rectangle(viz, cv::Point(4, viz.rows - 26), cv::Point(8 + sz.width, viz.rows - 6), cv::Scalar(0, 0, 0), -1);
-                cv::putText(viz, st, cv::Point(6, viz.rows - 10),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-                std::lock_guard<std::mutex> lk(g_viz_mtx);
-                g_viz_frame = std::move(viz);
+            cv::Mat viz;
+            if (g_stream_max_w > 0 && frame.cols > g_stream_max_w) {
+                const int nw = g_stream_max_w;
+                const int nh = std::max(1, (int)std::lround(
+                    frame.rows * (double)nw / (double)frame.cols));
+                cv::resize(frame, viz, cv::Size(nw, nh), 0, 0, cv::INTER_LINEAR);
+            } else {
+                viz = frame.clone();
             }
+            if (g_tracking.load() && smooth_init) {
+                draw_grid(viz, smooth_cx, smooth_cy, smooth_h, smooth_score);
+                draw_tracking(viz, smooth_cx, smooth_cy, smooth_h, smooth_score);
+            } else {
+                draw_grid(viz);
+            }
+            char st[128];
+            snprintf(st, sizeof(st), "FPS:%.0f  track:%.1fms avg %.1fmax",
+                     stat_fps, stat_track_ms_avg, stat_track_ms_max_v);
+            int baseline = 0;
+            cv::Size sz = cv::getTextSize(st, cv::FONT_HERSHEY_SIMPLEX, 0.45, 1, &baseline);
+            cv::rectangle(viz, cv::Point(4, viz.rows - 26), cv::Point(8 + sz.width, viz.rows - 6), cv::Scalar(0, 0, 0), -1);
+            cv::putText(viz, st, cv::Point(6, viz.rows - 10),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+            std::lock_guard<std::mutex> lk(g_viz_mtx);
+            g_viz_frame = std::move(viz);
             g_viz_new.store(true, std::memory_order_release);
         }
 

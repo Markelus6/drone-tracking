@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <fcntl.h>
 #include <mutex>
 #include <string>
@@ -38,7 +39,12 @@ static void on_sig(int) { g_running = false; }
 
 static int lost_frames_threshold() {
     if (const char* e = std::getenv("LIGHTTRACK_LOST_FRAMES")) return std::max(1, std::atoi(e));
-    return 12;
+    return 45;
+}
+
+static float lost_score_threshold() {
+    if (const char* e = std::getenv("LIGHTTRACK_LOST_SCORE")) return std::max(0.01f, (float)std::atof(e));
+    return 0.10f;
 }
 
 static std::string shm_name_from_dev(const std::string& dev) {
@@ -179,26 +185,32 @@ static void mjpeg_accept_thread() {
 static std::mutex g_viz_mtx;
 static cv::Mat g_viz_frame;
 static std::atomic<bool> g_viz_new{false};
+static int g_stream_max_w = 480;  // preview width; tracker stays full-res
+
+static int env_int(const char* a, const char* b, int defv, int lo, int hi) {
+    if (const char* e = std::getenv(a)) return std::max(lo, std::min(hi, std::atoi(e)));
+    if (b) if (const char* e = std::getenv(b)) return std::max(lo, std::min(hi, std::atoi(e)));
+    return defv;
+}
 
 static void mjpeg_encoder_thread() {
-    int period_ms = 100;
-    if (const char* e = std::getenv("LIGHTTRACK_MJPEG_PERIOD_MS")) {
-        period_ms = std::max(20, std::atoi(e));
-    } else if (const char* e = std::getenv("VISION_MJPEG_PERIOD_MS")) {
-        period_ms = std::max(20, std::atoi(e));
-    }
+    // ~30 FPS preview. Load cut via smaller encode size + quality, not by dropping FPS.
+    const int period_ms = env_int("LIGHTTRACK_MJPEG_PERIOD_MS", "VISION_MJPEG_PERIOD_MS", 33, 16, 200);
+    const int jpeg_q = env_int("LIGHTTRACK_MJPEG_QUALITY", "VISION_MJPEG_QUALITY", 40, 20, 95);
     using clock = std::chrono::steady_clock;
     auto last_encode = clock::now();
+    std::fprintf(stderr, "[LightTrack] MJPEG encode period=%dms q=%d stream_max_w=%d\n",
+                 period_ms, jpeg_q, g_stream_max_w);
     while (g_running) {
-        if (!g_viz_new.load(std::memory_order_acquire)) { usleep(2000); continue; }
+        if (!g_viz_new.load(std::memory_order_acquire)) { usleep(1000); continue; }
         auto now = clock::now();
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_encode).count();
-        if (elapsed < period_ms) { usleep(2000); continue; }
+        if (elapsed < period_ms) { usleep(1000); continue; }
         cv::Mat local;
-        { std::lock_guard<std::mutex> lk(g_viz_mtx); local = g_viz_frame.clone(); g_viz_new.store(false); }
+        { std::lock_guard<std::mutex> lk(g_viz_mtx); local = std::move(g_viz_frame); g_viz_new.store(false); }
         if (local.empty()) continue;
         std::vector<uchar> buf;
-        std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 50};
+        std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, jpeg_q};
         cv::imencode(".jpg", local, buf, params);
         { std::lock_guard<std::mutex> lk(g_mjpeg_mtx); g_mjpeg_jpeg = std::move(buf); }
         g_mjpeg_seq.fetch_add(1, std::memory_order_release);
@@ -394,6 +406,12 @@ cvs.addEventListener('mouseup', e => {
     const cy = ((startY + ey) / 2) / cvs.height;
     const w = Math.abs(ex - startX) / cvs.width;
     const h = Math.abs(ey - startY) / cvs.height;
+    if (w < 0.03 || h < 0.03) {
+        document.getElementById('status').textContent =
+            'Draw a box (click-drag), not a click';
+        ctx.clearRect(0, 0, cvs.width, cvs.height);
+        return;
+    }
     document.getElementById('status').textContent =
         'Sending: cx=' + cx.toFixed(3) + ' cy=' + cy.toFixed(3) +
         ' w=' + w.toFixed(3) + ' h=' + h.toFixed(3);
@@ -421,7 +439,8 @@ cvs.addEventListener('mouseup', e => {
             const char* p = strstr(req, "cx=");
             float cx = 0.5f, cy = 0.5f, w = 0.2f, h = 0.2f;
             if (p) std::sscanf(p, "cx=%f&cy=%f&w=%f&h=%f", &cx, &cy, &w, &h);
-            if (w < 0.01f) w = h;
+            if (w < 0.03f) w = 0.08f;
+            if (h < 0.03f) h = 0.08f;
 
             int cmd_sock = socket(AF_INET, SOCK_DGRAM, 0);
             struct sockaddr_in cmd_addr{};
@@ -483,6 +502,7 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("LIGHTTRACK_CAM_NAME")) cam_name = e;
     if (const char* e = std::getenv("LIGHTTRACK_VIZ_PORT")) g_mjpeg_port = std::atoi(e);
     if (const char* e = std::getenv("LIGHTTRACK_FRAME_STRIDE")) frame_stride = std::max(1, std::atoi(e));
+    g_stream_max_w = env_int("LIGHTTRACK_STREAM_MAX_W", "VISION_STREAM_MAX_W", 480, 0, 1920);
 
     LightTrack tracker;
     if (!tracker.load_models(model_dir)) {
@@ -583,9 +603,9 @@ int main(int argc, char** argv) {
                         static_cast<int>(g_init_cy * h - bh * 0.5f),
                         static_cast<int>(bw), static_cast<int>(bh));
             bb &= cv::Rect(0, 0, w, h);
-            if (bb.width < 16 || bb.height < 16) {
+            if (bb.width < 24 || bb.height < 24) {
                 g_tracking = false;
-                std::fprintf(stderr, "[LightTrack] init rejected: bbox too small\n");
+                std::fprintf(stderr, "[LightTrack] init rejected: bbox too small (%dx%d)\n", bb.width, bb.height);
                 continue;
             }
             tracker.init(frame, bb);
@@ -603,7 +623,7 @@ int main(int argc, char** argv) {
                     if (const char* e = std::getenv("LIGHTTRACK_INIT_SIZE_HOLD_FRAMES")) {
                         return std::max(0, std::atoi(e));
                     }
-                    return 6;
+                    return 8;
                 }();
                 smooth_cx = g_init_cx;
                 smooth_cy = g_init_cy;
@@ -613,10 +633,11 @@ int main(int argc, char** argv) {
                 smooth_init = true;
                 const int hold_ms = []() {
                     if (const char* e = std::getenv("LIGHTTRACK_HOLD_MS")) return std::max(0, std::atoi(e));
-                    return 0;
+                    return 200;
                 }();
                 init_hold_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(hold_ms);
-                continue;
+                reacq_h = 0;
+                // Fall through so MJPEG keeps updating during hold.
             } else {
                 g_tracking = false;
                 std::fprintf(stderr, "[LightTrack] init failed %d,%d %dx%d\n", bb.x, bb.y, bb.width, bb.height);
@@ -634,13 +655,9 @@ int main(int argc, char** argv) {
                 sendto(telem_sock, hold, std::strlen(hold), 0,
                        reinterpret_cast<struct sockaddr*>(&telem_addr), sizeof(telem_addr));
             }
-            continue;
-        }
-
-        if (should_track && g_tracking && tracker.is_initialized()) {
+        } else if (should_track && g_tracking && tracker.is_initialized()) {
             const auto now_tr = std::chrono::steady_clock::now();
-            if (now_tr < init_hold_until) continue;
-
+            if (now_tr >= init_hold_until) {
             auto t0 = std::chrono::steady_clock::now();
             tracker.track(frame);
             auto t1 = std::chrono::steady_clock::now();
@@ -671,33 +688,45 @@ int main(int argc, char** argv) {
                 }
             }
             const float sc = tracker.state.cls_score_max;
+            const float peak_margin = tracker.state.peak_margin;
+            const float lost_sc = lost_score_threshold();
+            const int lost_n = lost_frames_threshold();
+            const bool weak = (sc < lost_sc);
 
-            // cls score alone is not a reliable loss signal (it can remain high
-            // on background). Only stop after a sustained near-zero response.
-            if (sc < 0.03f) {
+            if (weak) {
                 lost_streak++;
+                if (lost_streak >= lost_n) {
+                    reacq_cx = smooth_cx > 0.001f ? smooth_cx : cx;
+                    reacq_cy = smooth_cy > 0.001f ? smooth_cy : cy;
+                    reacq_w = smooth_w > 0.01f ? smooth_w : tw;
+                    reacq_h = smooth_h > 0.01f ? smooth_h : th;
+                    g_tracking = false;
+                    smooth_init = false;
+                    lost_streak = 0;
+                    fprintf(stderr, "[LightTrack] LOST: score=%.3f margin=%.3f; waiting for validated init\n",
+                            sc, peak_margin);
+                    char msg[128];
+                    std::snprintf(msg, sizeof(msg), "{\"cam\":\"%s\",\"tracker\":\"lighttrack\",\"lost\":true}", cam_name.c_str());
+                    sendto(telem_sock, msg, std::strlen(msg), 0, reinterpret_cast<struct sockaddr*>(&telem_addr), sizeof(telem_addr));
+                } else if (smooth_init) {
+                    cx = smooth_cx;
+                    cy = smooth_cy;
+                }
             } else {
-                lost_streak = std::max(0, lost_streak - 2);
-            }
-            if (lost_streak >= 60) {
-                reacq_cx = smooth_cx > 0.001f ? smooth_cx : cx;
-                reacq_cy = smooth_cy > 0.001f ? smooth_cy : cy;
-                reacq_w = smooth_w > 0.01f ? smooth_w : (tracker.state.target_sz.x / static_cast<float>(frame.cols));
-                reacq_h = smooth_h > 0.01f ? smooth_h : th;
-                g_tracking = false;
-                smooth_init = false;
-                lost_streak = 0;
-                fprintf(stderr, "[LightTrack] LOST: sustained score=%.3f; waiting for validated init\n", sc);
-                char msg[128];
-                std::snprintf(msg, sizeof(msg), "{\"cam\":\"%s\",\"tracker\":\"lighttrack\",\"lost\":true}", cam_name.c_str());
-                sendto(telem_sock, msg, std::strlen(msg), 0, reinterpret_cast<struct sockaddr*>(&telem_addr), sizeof(telem_addr));
-                continue;
+                lost_streak = std::max(0, lost_streak - 3);
             }
 
-            const float output_motion = smooth_init
-                ? std::hypot(cx - smooth_cx, cy - smooth_cy)
-                : 0.0f;
-            const float alpha = output_motion > 0.01f ? 0.85f : 0.55f;
+            if (g_tracking) {
+            float alpha = 0.15f;
+            if (sc >= 0.45f) {
+                const float output_motion = smooth_init
+                    ? std::hypot(cx - smooth_cx, cy - smooth_cy) : 0.0f;
+                alpha = output_motion > 0.02f ? 0.70f : 0.45f;
+            } else if (sc >= 0.30f) {
+                alpha = 0.30f;
+            } else if (weak) {
+                alpha = 0.0f;
+            }
             if (smooth_init) {
                 smooth_cx = smooth_cx * (1.0f - alpha) + cx * alpha;
                 smooth_cy = smooth_cy * (1.0f - alpha) + cy * alpha;
@@ -708,41 +737,44 @@ int main(int argc, char** argv) {
             cx = smooth_cx;
             cy = smooth_cy;
 
-            smooth_score = sc;
+            smooth_score = weak ? smooth_score * 0.9f + sc * 0.1f : sc;
             smooth_init = true;
-            if (!size_locked) {
-                smooth_w = smooth_w > 0.01f ? smooth_w * 0.9f + tw * 0.1f : tw;
-                smooth_h = smooth_h > 0.01f ? smooth_h * 0.9f + th * 0.1f : th;
+            if (!size_locked && !weak && sc >= 0.30f) {
+                smooth_w = smooth_w > 0.01f ? smooth_w * 0.88f + tw * 0.12f : tw;
+                smooth_h = smooth_h > 0.01f ? smooth_h * 0.88f + th * 0.12f : th;
             }
             if (smooth_w <= 0.01f) smooth_w = smooth_h;
-            const float floor_ratio = []() {
-                if (const char* e = std::getenv("LIGHTTRACK_SIZE_FLOOR")) {
-                    return std::max(0.0f, std::min(1.0f, (float)std::atof(e)));
-                }
-                return 0.0f;
-            }();
-            if (floor_ratio > 0.01f && init_lock_w > 0.01f) {
-                const float floor_w = init_lock_w * floor_ratio;
-                smooth_w = std::max(smooth_w, floor_w);
+            if (init_lock_w > 0.01f) {
+                smooth_w = std::clamp(smooth_w, init_lock_w * 0.55f, init_lock_w * 2.2f);
             }
-            if (floor_ratio > 0.01f && init_lock_h > 0.01f) {
-                const float floor_h = init_lock_h * floor_ratio;
-                smooth_h = std::max(smooth_h, floor_h);
+            if (init_lock_h > 0.01f) {
+                smooth_h = std::clamp(smooth_h, init_lock_h * 0.55f, init_lock_h * 2.2f);
             }
 
+            const float pub_conf = weak ? std::min(sc, 0.20f) : sc;
             char msg[320];
             std::snprintf(msg, sizeof(msg),
                 "{\"cam\":\"%s\",\"tracker\":\"lighttrack\",\"bbox_norm\":[%.4f,%.4f,%.4f,%.4f],"
-                "\"class_id\":0,\"conf\":%.3f}",
-                cam_name.c_str(), cx, cy, smooth_w, smooth_h, sc);
+                "\"class_id\":0,\"conf\":%.3f,\"peak_margin\":%.3f}",
+                cam_name.c_str(), cx, cy, smooth_w, smooth_h, pub_conf, peak_margin);
             sendto(telem_sock, msg, std::strlen(msg), 0,
                    reinterpret_cast<struct sockaddr*>(&telem_addr), sizeof(telem_addr));
+            } // g_tracking
+            } // init_hold done
         }
 
         {
             extern std::atomic<int> g_mjpeg_clients;
             if (g_mjpeg_clients.load() > 0) {
-                cv::Mat viz = frame.clone();
+                cv::Mat viz;
+                if (g_stream_max_w > 0 && frame.cols > g_stream_max_w) {
+                    const int nw = g_stream_max_w;
+                    const int nh = std::max(1, (int)std::lround(
+                        frame.rows * (double)nw / (double)frame.cols));
+                    cv::resize(frame, viz, cv::Size(nw, nh), 0, 0, cv::INTER_LINEAR);
+                } else {
+                    viz = frame.clone();
+                }
                 if (g_tracking.load() && smooth_init) {
                     draw_grid(viz, smooth_cx, smooth_cy, smooth_h, smooth_score);
                     draw_tracking(viz, smooth_cx, smooth_cy, smooth_w, smooth_h, smooth_score);
@@ -759,8 +791,8 @@ int main(int argc, char** argv) {
                             cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
                 std::lock_guard<std::mutex> lk(g_viz_mtx);
                 g_viz_frame = std::move(viz);
+                g_viz_new.store(true, std::memory_order_release);
             }
-            g_viz_new.store(true, std::memory_order_release);
         }
 
         auto now = std::chrono::steady_clock::now();

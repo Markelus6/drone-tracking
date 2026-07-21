@@ -1,5 +1,5 @@
 [Unit]
-Description=drone-tracking (orch + tracker + stats :8090)
+Description=drone-tracking (orch + tracker + Betaflight MSP + stats :8090)
 After=network-online.target
 Wants=network-online.target
 
@@ -8,10 +8,20 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/root/drone-tracking/deploy
 Environment=DRON_PROJECT_DIR=/root/drone-tracking
-Environment=TRACKER=light
+Environment=TRACKER=nanov3
 Environment=TRACK_CAMERA=/dev/cam_usb2
 Environment=STATS_WEB_PORT=8090
 Environment=VISION_TELEMETRY_PORT=12345
+Environment=VISION_MJPEG_PERIOD_MS=33
+Environment=VISION_MJPEG_QUALITY=40
+Environment=VISION_STREAM_MAX_W=480
+Environment=BF_MSP_ENABLE=1
+Environment=BF_MSP_PORT=/dev/ttyS4
+Environment=BF_MSP_BAUD=115200
+Environment=BF_MSP_HZ=50
+Environment=BF_GUIDANCE_ENABLE=0
+Environment=BF_ARM_ENABLE=0
+Environment=BF_MAP=aetr
 ExecStart=/bin/bash /root/drone-tracking/deploy/start_tracking.sh start
 ExecStop=/bin/bash /root/drone-tracking/deploy/start_tracking.sh stop
 TimeoutStartSec=60

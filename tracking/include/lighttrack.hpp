@@ -19,6 +19,8 @@ struct LightTrackConfig {
     int total_stride = 16;
     int score_size = 18;
     float context_amount = 0.5f;
+    float min_move_score = 0.18f;
+    float min_peak_margin = 0.012f;
 };
 
 struct LightTrackState {
@@ -27,6 +29,8 @@ struct LightTrackState {
     cv::Point target_pos{0, 0};
     cv::Point2f target_sz{0.f, 0.f};
     float cls_score_max = 0.f;
+    float peak_margin = 0.f;
+    float response_psr = 0.f;
 };
 
 class LightTrack {

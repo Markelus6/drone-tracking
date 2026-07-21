@@ -175,10 +175,18 @@ void LightTrack::update(const cv::Mat& x_crop, cv::Point& tp, cv::Point2f& tsz, 
 
     int r_max = 0, c_max = 0;
     float maxScore = 0;
+    float secondScore = 0;
     std::vector<float> pscore(plane);
     for (int i = 0; i < plane; i++) {
         pscore[i] = (penalty[i] * cls_sigmoid[i]) * (1.0f - cfg.window_influence) + window[i] * cfg.window_influence;
-        if (pscore[i] > maxScore) { maxScore = pscore[i]; r_max = i / score_sz_; c_max = i - r_max * score_sz_; }
+        if (pscore[i] > maxScore) {
+            secondScore = maxScore;
+            maxScore = pscore[i];
+            r_max = i / score_sz_;
+            c_max = i - r_max * score_sz_;
+        } else if (pscore[i] > secondScore) {
+            secondScore = pscore[i];
+        }
     }
 
     int best = r_max * score_sz_ + c_max;
@@ -193,7 +201,12 @@ void LightTrack::update(const cv::Mat& x_crop, cv::Point& tp, cv::Point2f& tsz, 
     cls_var /= std::max(1, plane);
     const float psr = (cls_sigmoid[best] - cls_mean) / (std::sqrt(cls_var) + 1e-6f);
     const float response_quality = std::clamp((psr - 1.5f) / 5.0f, 0.0f, 1.0f);
-    const float effective_score = cls_sigmoid[best] * response_quality;
+    const float raw_score = cls_sigmoid[best];
+    const float peak_margin = maxScore - secondScore;
+    float effective_score = raw_score * (0.55f + 0.45f * response_quality);
+    if (peak_margin < cfg.min_peak_margin) {
+        effective_score *= 0.85f;
+    }
 
     float pred_xs = (px1[best] + px2[best]) / 2.0f;
     float pred_ys = (py1[best] + py2[best]) / 2.0f;
@@ -212,39 +225,41 @@ void LightTrack::update(const cv::Mat& x_crop, cv::Point& tp, cv::Point2f& tsz, 
     float raw_cx = tp.x + diff_xs;
     float raw_cy = tp.y + diff_ys;
 
-    // Tracker scores can stay high after drifting onto background, so never feed
-    // unbounded position/scale changes back into the next search crop.
     const float dx = raw_cx - tp.x;
     const float dy = raw_cy - tp.y;
     const float move = std::sqrt(dx * dx + dy * dy);
     float pos_alpha = 0.0f;
-    float max_step_factor = 0.35f;
+    float max_step_factor = 0.20f;
     if (effective_score >= 0.50f) {
-        pos_alpha = 0.95f;
-        max_step_factor = 1.25f;
+        pos_alpha = peak_margin >= cfg.min_peak_margin ? 0.90f : 0.55f;
+        max_step_factor = peak_margin >= cfg.min_peak_margin ? 1.10f : 0.55f;
     } else if (effective_score >= 0.30f) {
-        pos_alpha = 0.78f;
-        max_step_factor = 0.90f;
-    } else if (effective_score >= 0.15f) {
-        pos_alpha = 0.50f;
-        max_step_factor = 0.50f;
+        pos_alpha = 0.45f;
+        max_step_factor = 0.55f;
+    } else if (effective_score >= cfg.min_move_score) {
+        pos_alpha = 0.20f;
+        max_step_factor = 0.30f;
     }
     const float max_step = std::max(3.0f, max_step_factor * std::max(tsz.x, tsz.y));
     const float step_scale = move > max_step ? max_step / move : 1.0f;
     tp.x = (int)std::round(tp.x + dx * step_scale * pos_alpha);
     tp.y = (int)std::round(tp.y + dy * step_scale * pos_alpha);
 
-    const float size_alpha = std::min(0.06f, lr);
-    float next_w = tsz.x * (1.0f - size_alpha) + pred_w * size_alpha;
-    float next_h = tsz.y * (1.0f - size_alpha) + pred_h * size_alpha;
-    const float min_w = std::max(10.0f, initial_target_sz_.x * 0.65f);
-    const float max_w = std::max(min_w, initial_target_sz_.x * 2.50f);
-    const float min_h = std::max(10.0f, initial_target_sz_.y * 0.65f);
-    const float max_h = std::max(min_h, initial_target_sz_.y * 2.50f);
-    tsz.x = std::clamp(next_w, min_w, max_w);
-    tsz.y = std::clamp(next_h, min_h, max_h);
+    if (effective_score >= 0.28f) {
+        const float size_alpha = std::min(0.08f, lr);
+        float next_w = tsz.x * (1.0f - size_alpha) + pred_w * size_alpha;
+        float next_h = tsz.y * (1.0f - size_alpha) + pred_h * size_alpha;
+        const float min_w = std::max(10.0f, initial_target_sz_.x * 0.55f);
+        const float max_w = std::max(min_w, initial_target_sz_.x * 2.50f);
+        const float min_h = std::max(10.0f, initial_target_sz_.y * 0.55f);
+        const float max_h = std::max(min_h, initial_target_sz_.y * 2.50f);
+        tsz.x = std::clamp(next_w, min_w, max_w);
+        tsz.y = std::clamp(next_h, min_h, max_h);
+    }
 
-    cls_score_max = effective_score;
+    state.peak_margin = peak_margin;
+    state.response_psr = psr;
+    cls_score_max = raw_score;
 }
 
 void LightTrack::track(const cv::Mat& im) {
