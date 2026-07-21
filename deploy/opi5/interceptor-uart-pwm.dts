@@ -1,0 +1,42 @@
+/dts-v1/;
+/plugin/;
+
+/* Orange Pi 5 (RK3588S) — interceptor: ELRS + FC MSP + cam servo
+ * Enable via /boot/orangepiEnv.txt:
+ *   overlays=uart1-m1 uart3-m0 pwm3-m0
+ * This fragment documents the intended mux; vendor .dtbo names above
+ * are preferred on Orangepi OS 1.3.x. Use this .dts only if you build
+ * a custom dtbo with dtc -@ -I dts -O dtb.
+ */
+
+/ {
+	compatible = "rockchip,rk3588s-orangepi-5", "rockchip,rk3588-orangepi-5",
+		     "rockchip,rk3588s", "rockchip,rk3588";
+
+	fragment@0 {
+		target = <&uart1>;
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart1m1_xfer>;
+		};
+	};
+
+	fragment@1 {
+		target = <&uart3>;
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart3m0_xfer>;
+		};
+	};
+
+	fragment@2 {
+		target = <&pwm3>;
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "active";
+			pinctrl-0 = <&pwm3m0_pins>;
+		};
+	};
+};

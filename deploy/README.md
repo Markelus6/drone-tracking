@@ -1,53 +1,56 @@
-# Deploy notes — Orange Pi 5 / RK3588
+# Deploy notes — Orange Pi 5 / RK3588 interceptor
 
 ## Layout on board
 
 ```text
-/root/drone-tracking/
+drone-tracking/
   orchestrator/build/orch_daemon
   tracking/build/{nanotrack_fc,lighttrack_fc}
-  tracking/models/...
+  control/build/{chase_fc,osd_overlay}
   deploy/
     start_tracking.sh
-    stats_web.py          # HTTP :8090
-    drone-tracking.service
+    chase.json
+    opi5/WIRING.md
+    stats_web.py
     logs/
 ```
 
 ## First install
 
 ```bash
-# on build host or on the board
-scp -r drone-tracking root@<IP>:/root/
-
-ssh root@<IP>
-cd /root/drone-tracking
+cd ~/drone-tracking
 bash deploy/build_all.sh
-chmod +x deploy/start_tracking.sh deploy/build_all.sh
-
-# optional systemd
-cp deploy/drone-tracking.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now drone-tracking
+chmod +x deploy/*.sh deploy/opi5/*.sh control/build.sh
+sudo bash deploy/opi5/install_overlays.sh
+sudo reboot
+# after reboot: wire ELRS/FC/servo per deploy/opi5/WIRING.md
+# Betaflight: MSP on UART to Pi, Serial RX off, Receiver = MSP
 ```
 
 ## Manual control
 
 ```bash
-cd /root/drone-tracking/deploy
-TRACKER=light ./start_tracking.sh restart   # or TRACKER=nano
+cd deploy
+TRACKER=light ./start_tracking.sh restart
+DRON_ENABLE_CHASE=1 DRON_ENABLE_OSD=1 OSD_SINK=/dev/video10 ./start_tracking.sh restart
 ./start_tracking.sh status
 ./start_tracking.sh stop
 ```
+
+Set `servo_pwmchip` in `chase.json` after `ls -l /sys/class/pwm/` (pwm3).
 
 ## Ports
 
 | Port | Role |
 |------|------|
-| 8090 | Stats dashboard + `/stats.json` |
-| 5003 / 5004 | NanoTrack MJPEG / capture UI |
+| 8090 | Stats dashboard |
 | 5005 / 5006 | LightTrack MJPEG / capture UI |
-| 12345/udp | Tracker telemetry (stats listens) |
-| 12347 / 12349 | Nano / Light cmd |
+| 12345/udp | Tracker → chase (when chase on) |
+| 12346/udp | Chase → stats |
+| 12350/udp | Chase → osd_overlay |
+| 12349 | LightTrack cmd |
 
-Health: `curl http://127.0.0.1:8090/health` and `curl http://127.0.0.1:8090/stats.json`
+## SD / old RPi
+
+Recovered system snapshot: [reference/rpi_interceptor/](../reference/rpi_interceptor/).
+Short notes: [opi5/FORENSICS.md](opi5/FORENSICS.md).

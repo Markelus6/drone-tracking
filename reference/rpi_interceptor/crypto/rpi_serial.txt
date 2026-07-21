@@ -1,0 +1,2 @@
+# Real SoC serial from live Pi (NOT the Data Matrix sticker)
+100000005334d949

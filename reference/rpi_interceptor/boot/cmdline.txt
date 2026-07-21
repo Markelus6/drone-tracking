@@ -1,0 +1,1 @@
+console=tty3 root=PARTUUID=9e020a5c-02 rootfstype=ext4 fsck.repair=yes rootwait cfg80211.ieee80211_regdom=RU logo.nologo vt.global_cursor_default=0 quiet

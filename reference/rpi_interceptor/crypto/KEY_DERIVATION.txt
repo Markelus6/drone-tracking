@@ -1,0 +1,6 @@
+sk(/etc/fscrypt.key)=fd128c4509f91ea4d40ed74ed66eb758
+sn(SoC from live Pi)=100000005334d949
+keyfile = interleave(sn[i], sk[i]) for i in 0..15  (32 ASCII bytes)
+        = 1f0d0102080c040550393f49d19e4a94
+fscrypt unlock /opt/data --key=<keyfile>
+NOTE: Data Matrix sticker text/code 0000011051063167 was NOT the SoC serial.

@@ -10,8 +10,10 @@ Standalone visual object tracking for Orange Pi / RK3588.
 |------|------|
 | `tracking/` | NanoTrack + LightTrack (NCNN) |
 | `orchestrator/` | V4L2 → shared-memory camera frames |
+| `control/` | `chase_fc` (CRSF→MSP) + `osd_overlay` |
 | `tracking/models/` | NCNN `.param` / `.bin` weights |
-| `deploy/` | On-drone start scripts, systemd, stats `:8090` |
+| `deploy/` | On-drone start scripts, `chase.json`, stats `:8090` |
+| `reference/rpi_interceptor/` | Recovered old RPi system (app, config, unlock) |
 
 ## Dependencies
 
