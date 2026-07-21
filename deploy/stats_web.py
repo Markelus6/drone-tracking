@@ -94,7 +94,7 @@ _logs_dir_cache_mb: float | None = None
 _LOGS_DIR_CACHE_TTL_S = 30.0
 
 # Per-function caches for hot-path operations (no subprocess on every 250ms tick)
-_pid_cache: tuple[float, list[int]] = (0.0, [])
+_pid_cache: dict[str, tuple[float, list[int]]] = {}
 _ps_cache: tuple[float, dict[int, dict]] = (0.0, {})
 _listen_cache: tuple[float, set[int]] = (0.0, set())
 _PID_CACHE_TTL_S = 1.0
@@ -113,8 +113,9 @@ def _proc_cmdline(pid: int) -> str:
 def _find_pids_by_cmd_keyword(keyword: str) -> list[int]:
     global _pid_cache
     now = time.time()
-    if _pid_cache[0] and (now - _pid_cache[0]) < _PID_CACHE_TTL_S:
-        return list(_pid_cache[1])
+    cached = _pid_cache.get(keyword)
+    if cached and (now - cached[0]) < _PID_CACHE_TTL_S:
+        return list(cached[1])
     hits: list[int] = []
     try:
         entries = os.listdir("/proc")
@@ -127,7 +128,7 @@ def _find_pids_by_cmd_keyword(keyword: str) -> list[int]:
         if keyword in _proc_cmdline(pid):
             hits.append(pid)
     hits.sort()
-    _pid_cache = (now, hits)
+    _pid_cache[keyword] = (now, hits)
     return list(hits)
 
 
