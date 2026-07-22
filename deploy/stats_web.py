@@ -1308,24 +1308,61 @@ def run_server() -> None:
                 return self._send(200, "application/json; charset=utf-8", body)
             if path == "/cmd":
                 action = (qs.get("action") or [""])[0]
+                backend = (qs.get("backend") or ["light"])[0].lower()
                 if action not in ("init", "stop"):
                     return self._send(400, "text/plain; charset=utf-8", b"bad action\n")
                 ts = _tracker_snapshot(time.time())
-                port = ts.get("cmd_port")
-                if not port:
-                    return self._send(503, "text/plain; charset=utf-8", b"no cmd_port\n")
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    sock.settimeout(1.0)
-                    if action == "init":
-                        payload = b'{"cmd":"init","bbox_norm":[0.5,0.5,0.2,0.2]}'
-                    else:
-                        payload = b'{"cmd":"stop"}'
-                    sock.sendto(payload, ("127.0.0.1", port))
-                    sock.close()
-                    return self._send(200, "text/plain; charset=utf-8", b"ok\n")
-                except OSError as e:
-                    return self._send(500, "text/plain; charset=utf-8", f"send failed: {e}\n".encode())
+                running = ts.get("running", False)
+                if action == "init":
+                    if running:
+                        # Already running — send UDP re-init
+                        port = ts.get("cmd_port")
+                        if port:
+                            try:
+                                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                                sock.settimeout(1.0)
+                                sock.sendto(b'{"cmd":"init","bbox_norm":[0.5,0.5,0.2,0.2]}', ("127.0.0.1", port))
+                                sock.close()
+                            except OSError:
+                                pass
+                        return self._send(200, "text/plain; charset=utf-8", b"tracker already running, sent re-init\n")
+                    # Launch tracker binary
+                    binary_map = {
+                        "light": ("lighttrack_fc", "/root/drone-tracking/tracking/build/lighttrack_fc",
+                                   "--camera", "/dev/cam_usb2", "--models", "/root/drone-tracking/tracking/models/lighttrack",
+                                   "--cmd-port", "12349", "--viz-port", "5005"),
+                        "nano": ("lighttrack_fc", "/root/drone-tracking/tracking/build/multitrack_fc",
+                                 "--backend", "nano",
+                                 "--camera", "/dev/cam_usb2", "--models", "/root/drone-tracking/tracking/models",
+                                 "--cmd-port", "12347", "--viz-port", "5003"),
+                        "nanov3": ("lighttrack_fc", "/root/drone-tracking/tracking/build/multitrack_fc",
+                                   "--backend", "nanov3",
+                                   "--camera", "/dev/cam_usb2", "--models", "/root/drone-tracking/tracking/models/nanotrackv3",
+                                   "--cmd-port", "12351", "--viz-port", "5007"),
+                    }
+                    info = binary_map.get(backend, binary_map["light"])
+                    cmd_args = list(info[1:])
+                    try:
+                        subprocess.Popen(
+                            cmd_args,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            cwd="/root/drone-tracking/tracking/build",
+                            start_new_session=True,
+                        )
+                        return self._send(200, "text/plain; charset=utf-8", f"launched {backend}\n".encode())
+                    except OSError as e:
+                        return self._send(500, "text/plain; charset=utf-8", f"launch failed: {e}\n".encode())
+                # action == "stop"
+                if not running:
+                    return self._send(200, "text/plain; charset=utf-8", b"tracker not running\n")
+                pid = ts.get("pid")
+                if pid:
+                    try:
+                        os.kill(pid, 15)  # SIGTERM
+                    except OSError:
+                        pass
+                return self._send(200, "text/plain; charset=utf-8", b"stopped\n")
             return self._send(404, "text/plain; charset=utf-8", b"Not found\n")
 
     class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
