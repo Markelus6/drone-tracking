@@ -20,9 +20,11 @@ struct NanoTrackConfig {
     int total_stride = 16;
     int score_size = 16;
     float context_amount = 0.5f;
-    float template_update_rate = 0.01f;
-    float template_update_threshold = 0.5f;
-    int template_update_interval = 30;
+    float template_update_rate = 0.08f;
+    float template_update_threshold = 0.40f;
+    int template_update_interval = 20;
+    float min_move_score = 0.18f;      // below this: freeze position update
+    float min_peak_margin = 0.012f;    // soft ambiguity hint (not hard LOST)
 };
 
 struct NanoTrackState {
@@ -31,6 +33,8 @@ struct NanoTrackState {
     cv::Point target_pos{0, 0};
     cv::Point2f target_sz{0.f, 0.f};
     float cls_score_max = 0.f;
+    float peak_margin = 0.f;   // 1st − 2nd peak on response map
+    float response_psr = 0.f;  // peak-to-sidelobe style quality
 };
 
 class NanoTrack {
@@ -39,6 +43,8 @@ public:
     ~NanoTrack();
 
     bool load_models(const std::string& model_dir);
+    // Apply NanoTrackV3 hyper-params from official configv3.yaml.
+    void apply_preset_v3();
     void release();
     void init(const cv::Mat& img, const cv::Rect& bbox);
     void track(const cv::Mat& im);

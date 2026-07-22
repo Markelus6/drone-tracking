@@ -34,21 +34,57 @@ static std::vector<float> ratio_change_fun(const std::vector<float>& w, const st
 
 NanoTrack::~NanoTrack() { release(); }
 
+void NanoTrack::apply_preset_v3() {
+    // Official NanoTrackV3 (configv3.yaml)
+    cfg.penalty_k = 0.138f;
+    cfg.window_influence = 0.455f;
+    cfg.lr = 0.348f;
+    fprintf(stderr, "[NanoTrack] preset=v3 penalty_k=%.3f window=%.3f lr=%.3f\n",
+            cfg.penalty_k, cfg.window_influence, cfg.lr);
+}
+
 bool NanoTrack::load_models(const std::string& model_dir) {
     impl_ = new Impl();
-    std::string bp = model_dir + "/nanotrack_backbone_sim-opt.param";
-    std::string bb = model_dir + "/nanotrack_backbone_sim-opt.bin";
-    std::string hp = model_dir + "/nanotrack_head_sim-opt.param";
-    std::string hb = model_dir + "/nanotrack_head_sim-opt.bin";
-    if (impl_->backbone_t.load_param(bp.c_str()) != 0) { fprintf(stderr, "[ncnn] backbone param fail\n"); return false; }
-    if (impl_->backbone_t.load_model(bb.c_str()) != 0) { fprintf(stderr, "[ncnn] backbone bin fail\n"); return false; }
+    // Prefer V3 names, then V1 sim-opt names (current deploy).
+    const char* backbone_candidates[][2] = {
+        {"/nanotrack_backbone.param", "/nanotrack_backbone.bin"},
+        {"/nanotrack_backbone_sim-opt.param", "/nanotrack_backbone_sim-opt.bin"},
+        {"/nanotrack_backbone_sim.param", "/nanotrack_backbone_sim.bin"},
+    };
+    const char* head_candidates[][2] = {
+        {"/nanotrack_head.param", "/nanotrack_head.bin"},
+        {"/nanotrack_head_sim-opt.param", "/nanotrack_head_sim-opt.bin"},
+        {"/nanotrack_head_sim.param", "/nanotrack_head_sim.bin"},
+    };
+
+    std::string bp, bb, hp, hb;
+    auto try_pair = [&](const char* pairs[][2], int n, std::string& p, std::string& b) -> bool {
+        for (int i = 0; i < n; ++i) {
+            const std::string pp = model_dir + pairs[i][0];
+            const std::string bb2 = model_dir + pairs[i][1];
+            FILE* f = std::fopen(pp.c_str(), "rb");
+            if (!f) continue;
+            std::fclose(f);
+            p = pp; b = bb2;
+            return true;
+        }
+        return false;
+    };
+    if (!try_pair(backbone_candidates, 3, bp, bb) || !try_pair(head_candidates, 3, hp, hb)) {
+        fprintf(stderr, "[ncnn] no nanotrack backbone/head in %s\n", model_dir.c_str());
+        return false;
+    }
+
+    if (impl_->backbone_t.load_param(bp.c_str()) != 0) { fprintf(stderr, "[ncnn] backbone param fail: %s\n", bp.c_str()); return false; }
+    if (impl_->backbone_t.load_model(bb.c_str()) != 0) { fprintf(stderr, "[ncnn] backbone bin fail: %s\n", bb.c_str()); return false; }
     if (impl_->backbone_s.load_param(bp.c_str()) != 0) { fprintf(stderr, "[ncnn] backbone2 param fail\n"); return false; }
     if (impl_->backbone_s.load_model(bb.c_str()) != 0) { fprintf(stderr, "[ncnn] backbone2 bin fail\n"); return false; }
-    if (impl_->head.load_param(hp.c_str()) != 0) { fprintf(stderr, "[ncnn] head param fail\n"); return false; }
-    if (impl_->head.load_model(hb.c_str()) != 0) { fprintf(stderr, "[ncnn] head bin fail\n"); return false; }
+    if (impl_->head.load_param(hp.c_str()) != 0) { fprintf(stderr, "[ncnn] head param fail: %s\n", hp.c_str()); return false; }
+    if (impl_->head.load_model(hb.c_str()) != 0) { fprintf(stderr, "[ncnn] head bin fail: %s\n", hb.c_str()); return false; }
     create_grids();
     create_window();
-    fprintf(stderr, "[NanoTrack/ncnn] Models OK: %s score_sz=%d\n", model_dir.c_str(), score_sz_);
+    fprintf(stderr, "[NanoTrack/ncnn] Models OK: %s\n  backbone=%s\n  head=%s\n  score_sz=%d\n",
+            model_dir.c_str(), bp.c_str(), hp.c_str(), score_sz_);
     return true;
 }
 
@@ -136,36 +172,28 @@ void NanoTrack::init(const cv::Mat& img, const cv::Rect& bbox) {
 
 
 void NanoTrack::update_template(const cv::Mat& img) {
-    if (!impl_ || track_frames_ % 60 != 0 || track_frames_ < 60) return;
-    // Re-extract template features from current frame at target position
-    float c = (std::sqrt((state.target_sz.x + cfg.context_amount * (state.target_sz.x + state.target_sz.y)) *
-                         (state.target_sz.y + cfg.context_amount * (state.target_sz.x + state.target_sz.y)))) + 0.5f;
-    int c_int = static_cast<int>(c);
-    int cx = state.target_pos.x, cy = state.target_pos.y;
-    int img_w = img.cols, img_h = img.rows;
-    int x1 = std::max(0, cx - c_int), y1 = std::max(0, cy - c_int);
-    int x2 = std::min(img_w, cx + c_int), y2 = std::min(img_h, cy + c_int);
+    if (!impl_ || !initialized_ || img.empty()) return;
+    if (state.cls_score_max < cfg.template_update_threshold) return;
+    if (state.peak_margin < cfg.min_peak_margin) return;
+    if (track_frames_ < cfg.template_update_interval) return;
+    if (track_frames_ % cfg.template_update_interval != 0) return;
 
-    cv::Mat patch;
-    if (x2 > x1 && y2 > y1) {
-        patch = img(cv::Rect(x1, y1, x2 - x1, y2 - y1));
-    } else {
-        patch = img;
-    }
-    cv::Mat resized;
-    cv::resize(patch, resized, cv::Size(cfg.exemplar_size, cfg.exemplar_size));
-
-    ncnn::Mat in = ncnn::Mat::from_pixels(resized.data, ncnn::Mat::PIXEL_BGR2RGB, resized.cols, resized.rows);
+    // Same exemplar crop as init — never blend from a wrong/ambiguous lock.
+    float wc_z = state.target_sz.x + cfg.context_amount * (state.target_sz.x + state.target_sz.y);
+    float hc_z = state.target_sz.y + cfg.context_amount * (state.target_sz.x + state.target_sz.y);
+    float s_z = std::round(std::sqrt(wc_z * hc_z));
+    cv::Mat z_crop = get_subwindow_tracking(
+        img, cv::Point2f(state.target_pos), cfg.exemplar_size, (int)s_z, state.channel_ave);
+    ncnn::Mat in = ncnn::Mat::from_pixels(z_crop.data, ncnn::Mat::PIXEL_BGR2RGB, z_crop.cols, z_crop.rows);
     ncnn::Mat new_zf;
     ncnn::Extractor ex = impl_->backbone_t.create_extractor();
     ex.input("input", in);
     ex.extract("output", new_zf);
 
-    // Blend: 90% old template + 10% new (slow adaptation)
-    float alpha = 0.1f;
+    const float alpha = std::clamp(cfg.template_update_rate, 0.01f, 0.25f);
     float* old_ptr = static_cast<float*>(impl_->zf);
     float* new_ptr = static_cast<float*>(new_zf);
-    int total = impl_->zf.w * impl_->zf.h * impl_->zf.c;
+    const int total = impl_->zf.w * impl_->zf.h * impl_->zf.c;
     for (int i = 0; i < total; i++) {
         old_ptr[i] = old_ptr[i] * (1.0f - alpha) + new_ptr[i] * alpha;
     }
@@ -182,8 +210,6 @@ void NanoTrack::update(const cv::Mat& x_crop, cv::Point& tp, cv::Point2f& tsz, f
     const int plane = score_sz_ * score_sz_;
     std::vector<float> cls_sigmoid(plane);
     for (int i = 0; i < plane; i++) {
-        // NanoTrack head has two logits: background and target. Using sigmoid
-        // on the target logit alone made background patches score ~1.0.
         const float bg = cls_out[0 * plane + i];
         const float fg = cls_out[1 * plane + i];
         cls_sigmoid[i] = 1.0f / (1.0f + std::exp(std::clamp(bg - fg, -40.0f, 40.0f)));
@@ -208,10 +234,18 @@ void NanoTrack::update(const cv::Mat& x_crop, cv::Point& tp, cv::Point2f& tsz, f
 
     int r_max = 0, c_max = 0;
     float maxScore = 0;
+    float secondScore = 0;
     std::vector<float> pscore(plane);
     for (int i = 0; i < plane; i++) {
         pscore[i] = (penalty[i] * cls_sigmoid[i]) * (1.0f - cfg.window_influence) + window[i] * cfg.window_influence;
-        if (pscore[i] > maxScore) { maxScore = pscore[i]; r_max = i / score_sz_; c_max = i - r_max * score_sz_; }
+        if (pscore[i] > maxScore) {
+            secondScore = maxScore;
+            maxScore = pscore[i];
+            r_max = i / score_sz_;
+            c_max = i - r_max * score_sz_;
+        } else if (pscore[i] > secondScore) {
+            secondScore = pscore[i];
+        }
     }
 
     int best = r_max * score_sz_ + c_max;
@@ -226,7 +260,13 @@ void NanoTrack::update(const cv::Mat& x_crop, cv::Point& tp, cv::Point2f& tsz, f
     cls_var /= std::max(1, plane);
     const float psr = (cls_sigmoid[best] - cls_mean) / (std::sqrt(cls_var) + 1e-6f);
     const float response_quality = std::clamp((psr - 1.5f) / 5.0f, 0.0f, 1.0f);
-    const float effective_score = cls_sigmoid[best] * response_quality;
+    const float raw_score = cls_sigmoid[best];
+    const float peak_margin = maxScore - secondScore;
+    // Soft quality blend — never crush score to near-zero (that caused instant LOST).
+    float effective_score = raw_score * (0.55f + 0.45f * response_quality);
+    if (peak_margin < cfg.min_peak_margin) {
+        effective_score *= 0.85f;
+    }
 
     float pred_xs = (px1[best] + px2[best]) / 2.0f;
     float pred_ys = (py1[best] + py2[best]) / 2.0f;
@@ -248,37 +288,41 @@ void NanoTrack::update(const cv::Mat& x_crop, cv::Point& tp, cv::Point2f& tsz, f
     const float dx = raw_cx - tp.x;
     const float dy = raw_cy - tp.y;
     const float move = std::sqrt(dx * dx + dy * dy);
-    // Follow confident motion quickly. The old 0.20-size cap combined with a
-    // 0.35 blend and another output EMA only moved ~7% of one bbox per update,
-    // so a target could leave the search crop before the tracker caught up.
+
+    // Follow primarily by score; weak peak margin only slows the step.
     float pos_alpha = 0.0f;
-    float max_step_factor = 0.35f;
+    float max_step_factor = 0.20f;
     if (effective_score >= 0.50f) {
-        pos_alpha = 0.95f;
-        max_step_factor = 1.25f;
+        pos_alpha = peak_margin >= cfg.min_peak_margin ? 0.90f : 0.55f;
+        max_step_factor = peak_margin >= cfg.min_peak_margin ? 1.10f : 0.55f;
     } else if (effective_score >= 0.30f) {
-        pos_alpha = 0.78f;
-        max_step_factor = 0.90f;
-    } else if (effective_score >= 0.15f) {
-        pos_alpha = 0.50f;
-        max_step_factor = 0.50f;
+        pos_alpha = 0.45f;
+        max_step_factor = 0.55f;
+    } else if (effective_score >= cfg.min_move_score) {
+        pos_alpha = 0.20f;
+        max_step_factor = 0.30f;
     }
     const float max_step = std::max(3.0f, max_step_factor * std::max(tsz.x, tsz.y));
     const float step_scale = move > max_step ? max_step / move : 1.0f;
     tp.x = (int)std::round(tp.x + dx * step_scale * pos_alpha);
     tp.y = (int)std::round(tp.y + dy * step_scale * pos_alpha);
 
-    const float size_alpha = std::min(0.06f, lr);
-    float next_w = tsz.x * (1.0f - size_alpha) + pred_w * size_alpha;
-    float next_h = tsz.y * (1.0f - size_alpha) + pred_h * size_alpha;
-    const float min_w = std::max(10.0f, initial_target_sz_.x * 0.65f);
-    const float max_w = std::max(min_w, initial_target_sz_.x * 1.75f);
-    const float min_h = std::max(10.0f, initial_target_sz_.y * 0.65f);
-    const float max_h = std::max(min_h, initial_target_sz_.y * 1.75f);
-    tsz.x = std::clamp(next_w, min_w, max_w);
-    tsz.y = std::clamp(next_h, min_h, max_h);
+    // Size: only adapt when reasonably confident.
+    if (effective_score >= 0.28f) {
+        const float size_alpha = std::min(0.08f, lr);
+        float next_w = tsz.x * (1.0f - size_alpha) + pred_w * size_alpha;
+        float next_h = tsz.y * (1.0f - size_alpha) + pred_h * size_alpha;
+        const float min_w = std::max(10.0f, initial_target_sz_.x * 0.55f);
+        const float max_w = std::max(min_w, initial_target_sz_.x * 2.20f);
+        const float min_h = std::max(10.0f, initial_target_sz_.y * 0.55f);
+        const float max_h = std::max(min_h, initial_target_sz_.y * 2.20f);
+        tsz.x = std::clamp(next_w, min_w, max_w);
+        tsz.y = std::clamp(next_h, min_h, max_h);
+    }
 
-    cls_score_max = effective_score;
+    state.peak_margin = peak_margin;
+    state.response_psr = psr;
+    cls_score_max = raw_score;
 }
 
 void NanoTrack::track(const cv::Mat& im) {
@@ -311,6 +355,9 @@ void NanoTrack::track(const cv::Mat& im) {
     state.target_pos = tp;
     state.target_sz = tsz;
     state.cls_score_max = cls_score_max;
+
+    // Safe online template refresh (skipped automatically if score/margin weak).
+    update_template(im);
 }
 
 void NanoTrack::create_window() {

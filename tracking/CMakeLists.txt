@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.10)
 project(tracking_fc)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8.2-a+fp16+dotprod -ffast-math")
+endif()
 
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
@@ -16,13 +19,7 @@ link_directories("${NCNN_DIR}/lib")
 set(ORCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../orchestrator")
 include_directories("${ORCH_DIR}")
 
-# NanoTrack
-add_executable(nanotrack_fc
-  src/main.cpp
-  src/nanotrack.cpp
-  ${ORCH_DIR}/camera_orchestrator.cpp
-)
-target_link_libraries(nanotrack_fc
+set(COMMON_LIBS
   ${OpenCV_LIBS}
   ncnn
   pthread
@@ -31,17 +28,32 @@ target_link_libraries(nanotrack_fc
   gomp
 )
 
+# NanoTrack (production V1)
+add_executable(nanotrack_fc
+  src/main.cpp
+  src/nanotrack.cpp
+  ${ORCH_DIR}/camera_orchestrator.cpp
+)
+target_link_libraries(nanotrack_fc ${COMMON_LIBS})
+
 # LightTrack
 add_executable(lighttrack_fc
   src/lighttrack_main.cpp
   src/lighttrack.cpp
   ${ORCH_DIR}/camera_orchestrator.cpp
 )
-target_link_libraries(lighttrack_fc
-  ${OpenCV_LIBS}
-  ncnn
-  pthread
-  dl
-  rt
-  gomp
+target_link_libraries(lighttrack_fc ${COMMON_LIBS})
+
+# Unified comparison binary: nanov3 + OpenCV CSRT/KCF/... + DaSiam/GOTURN/CF/TCTrack-lite
+add_executable(multitrack_fc
+  src/multitrack_main.cpp
+  src/tracker_factory.cpp
+  src/opencv_legacy_tracker.cpp
+  src/opencv_modern_tracker.cpp
+  src/cf_ensemble_tracker.cpp
+  src/nanotrack.cpp
+  src/nanotrack_onnx.cpp
+  src/lighttrack.cpp
+  ${ORCH_DIR}/camera_orchestrator.cpp
 )
+target_link_libraries(multitrack_fc ${COMMON_LIBS})

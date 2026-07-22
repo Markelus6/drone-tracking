@@ -2,18 +2,17 @@
 """
 Stats web for drone-tracking — HTTP :8090 (dashboard + /stats.json).
 
-Adapted from drone-perehvatchik flight_controller stats (STATS_WEB_*),
-trimmed to the tracking-only stack: orch_daemon + nanotrack_fc / lighttrack_fc.
-
-Listens UDP telemetry (VISION_TELEMETRY_PORT, default 12345) for live bbox/FPS.
-If the port is already taken (e.g. flight controller), system/process stats still work.
+Tracks orch_daemon + nanotrack_fc / lighttrack_fc / multitrack_fc (any TRACKER backend),
+msp_betaflight.py, and live UDP/file telemetry (bbox/FPS).
 """
 
 from __future__ import annotations
 
+import glob as _glob_mod
 import http.server
 import json
 import os
+import re
 import socket
 import socketserver
 import subprocess
@@ -28,21 +27,28 @@ STATS_WEB_JSON_CACHE_MS = max(50, int(os.environ.get("STATS_WEB_JSON_CACHE_MS", 
 STATS_WEB_PREC_M = int(os.environ.get("STATS_WEB_PREC_M", "2"))
 STATS_WEB_PREC_AGE = int(os.environ.get("STATS_WEB_PREC_AGE", "2"))
 VISION_TELEMETRY_PORT = int(os.environ.get("VISION_TELEMETRY_PORT", "12345"))
-NANOTRACK_CMD_PORT = int(os.environ.get("NANOTRACK_CMD_PORT", "12347"))
-LIGHTTRACK_CMD_PORT = int(os.environ.get("LIGHTTRACK_CMD_PORT", "12349"))
-NANOTRACK_VIZ_PORT = int(os.environ.get("NANOTRACK_VIZ_PORT", "5003"))
-LIGHTTRACK_VIZ_PORT = int(os.environ.get("LIGHTTRACK_VIZ_PORT", "5005"))
-NANOTRACK_UI_PORT = int(os.environ.get("NANOTRACK_UI_PORT", "5004"))
-LIGHTTRACK_UI_PORT = int(os.environ.get("LIGHTTRACK_UI_PORT", "5006"))
+BF_TELEM_FILE = os.environ.get("BF_TELEM_FILE", "/dev/shm/drone_telem.json")
+STATS_SKIP_UDP = os.environ.get("STATS_SKIP_UDP", "0") == "1"
 LOGS_DIR = os.environ.get(
     "DRON_LOG_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
 )
 
+# Default ports by backend (must match multitrack_main.cpp / legacy binaries)
+_BACKEND_PORTS: dict[str, dict[str, int]] = {
+    "nano":   {"viz": 5003, "ui": 5004, "cmd": 12347},
+    "light":  {"viz": 5005, "ui": 5006, "cmd": 12349},
+    "nanov3": {"viz": 5007, "ui": 5008, "cmd": 12351},
+}
+
+_AVAILABLE_BACKENDS = ("nano", "light", "nanov3")
+
 _MONITOR_PROC_KEYS = (
     ("orch", "orch_daemon"),
+    ("multitrack", "multitrack_fc"),
     ("nanotrack", "nanotrack_fc"),
     ("lighttrack", "lighttrack_fc"),
+    ("msp_bf", "msp_betaflight.py"),
     ("stats", "stats_web.py"),
 )
 
@@ -87,6 +93,14 @@ _logs_dir_cache_ts = 0.0
 _logs_dir_cache_mb: float | None = None
 _LOGS_DIR_CACHE_TTL_S = 30.0
 
+# Per-function caches for hot-path operations (no subprocess on every 250ms tick)
+_pid_cache: dict[str, tuple[float, list[int]]] = {}
+_ps_cache: tuple[float, dict[int, dict]] = (0.0, {})
+_listen_cache: tuple[float, set[int]] = (0.0, set())
+_PID_CACHE_TTL_S = 1.0
+_PS_CACHE_TTL_S = 1.0
+_LISTEN_CACHE_TTL_S = 1.0
+
 
 def _proc_cmdline(pid: int) -> str:
     try:
@@ -97,6 +111,11 @@ def _proc_cmdline(pid: int) -> str:
 
 
 def _find_pids_by_cmd_keyword(keyword: str) -> list[int]:
+    global _pid_cache
+    now = time.time()
+    cached = _pid_cache.get(keyword)
+    if cached and (now - cached[0]) < _PID_CACHE_TTL_S:
+        return list(cached[1])
     hits: list[int] = []
     try:
         entries = os.listdir("/proc")
@@ -109,10 +128,15 @@ def _find_pids_by_cmd_keyword(keyword: str) -> list[int]:
         if keyword in _proc_cmdline(pid):
             hits.append(pid)
     hits.sort()
-    return hits
+    _pid_cache[keyword] = (now, hits)
+    return list(hits)
 
 
 def _ps_metrics_for_pids(pids: list[int]) -> dict[int, dict]:
+    global _ps_cache
+    now = time.time()
+    if _ps_cache[0] and (now - _ps_cache[0]) < _PS_CACHE_TTL_S:
+        return dict(_ps_cache[1])
     if not pids:
         return {}
     try:
@@ -141,7 +165,8 @@ def _ps_metrics_for_pids(pids: list[int]) -> dict[int, dict]:
             }
         except (ValueError, IndexError):
             continue
-    return out
+    _ps_cache = (now, out)
+    return dict(out)
 
 
 def _read_meminfo_mb() -> dict:
@@ -341,27 +366,163 @@ def _count_established_tcp_by_local_port() -> tuple[dict[int, int], bool]:
     return counts, True
 
 
+def _parse_backend_from_cmdline(cmd: str) -> str | None:
+    m = re.search(r"--backend[=\s]+([A-Za-z0-9_+\-]+)", cmd)
+    if m:
+        return m.group(1).lower()
+    env = (os.environ.get("TRACKER") or os.environ.get("MULTITRACK_BACKEND") or "").strip().lower()
+    return env or None
+
+
+def _ports_for_backend(name: str | None) -> dict[str, int]:
+    key = (name or "").lower()
+    if key in _BACKEND_PORTS:
+        return dict(_BACKEND_PORTS[key])
+    # aliases
+    aliases = {
+        "nanotrack": "nano", "nano_v3": "nanov3", "v3": "nanov3",
+        "lighttrack": "light",
+    }
+    key = aliases.get(key, key)
+    return dict(_BACKEND_PORTS.get(key, {"viz": 5007, "ui": 5008, "cmd": 12351}))
+
+
+def _detect_active_tracker() -> dict[str, Any]:
+    """Return {binary, pid, backend, cmdline} for the running tracker process."""
+    for binary, kw in (
+        ("multitrack_fc", "multitrack_fc"),
+        ("nanotrack_fc", "nanotrack_fc"),
+        ("lighttrack_fc", "lighttrack_fc"),
+    ):
+        pids = _find_pids_by_cmd_keyword(kw)
+        if not pids:
+            continue
+        pid = pids[0]
+        cmd = _proc_cmdline(pid)
+        if binary == "nanotrack_fc":
+            backend = "nano"
+        elif binary == "lighttrack_fc":
+            backend = "light"
+        else:
+            backend = _parse_backend_from_cmdline(cmd) or "nanov3"
+        return {"binary": binary, "pid": pid, "backend": backend, "cmdline": cmd}
+    return {"binary": None, "pid": None, "backend": None, "cmdline": ""}
+
+
+def _listening_tcp_ports() -> set[int]:
+    global _listen_cache
+    now = time.time()
+    if _listen_cache[0] and (now - _listen_cache[0]) < _LISTEN_CACHE_TTL_S:
+        return set(_listen_cache[1])
+    ports: set[int] = set()
+
+    def _parse(path: str) -> None:
+        try:
+            with open(path, "r", encoding="ascii") as f:
+                next(f, None)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 4:
+                        continue
+                    if parts[3] != "0A":
+                        continue
+                    local = parts[1]
+                    if ":" not in local:
+                        continue
+                    try:
+                        ports.add(int(local.rsplit(":", 1)[-1], 16))
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+
+    _parse("/proc/net/tcp")
+    _parse("/proc/net/tcp6")
+    _listen_cache = (now, ports)
+    return set(ports)
+
+
+def _stream_viewer_html(port: int, kind: str = "mjpeg") -> str:
+    host_js = "location.hostname"
+    if kind == "ui":
+        title = f"Capture UI :{port}"
+        body = f"""
+  <h2 style="font:14px monospace;color:#0f0;margin:8px">Capture UI → port {port}</h2>
+  <p style="font:12px monospace;color:#9aa0a6;margin:8px">
+    <a id="go" href="#">open directly</a>
+  </p>
+  <iframe id="fr" style="width:100%;height:90vh;border:1px solid #0f0;background:#111"></iframe>
+  <script>
+    const u = 'http://' + {host_js} + ':{port}/';
+    document.getElementById('go').href = u;
+    document.getElementById('fr').src = u;
+  </script>"""
+    else:
+        title = f"MJPEG :{port}"
+        body = f"""
+  <h2 style="font:14px monospace;color:#0f0;margin:8px">MJPEG → port {port}</h2>
+  <p style="font:12px monospace;color:#9aa0a6;margin:8px">
+    <a id="go" href="#">direct stream</a> ·
+    <a id="snap" href="#">snap.jpg</a>
+  </p>
+  <img id="v" alt="stream" style="max-width:100%;background:#222;border:1px solid #0f0"/>
+  <script>
+    const base = 'http://' + {host_js} + ':{port}';
+    document.getElementById('go').href = base + '/';
+    document.getElementById('snap').href = base + '/snap.jpg';
+    const img = document.getElementById('v');
+    // Prefer continuous MJPEG; fall back to snap poll if stream fails.
+    img.onerror = function() {{
+      img.onerror = null;
+      setInterval(function() {{ img.src = base + '/snap.jpg?t=' + Date.now(); }}, 200);
+    }};
+    img.src = base + '/';
+  </script>"""
+    return f"""<!doctype html><html><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{title}</title>
+<style>body{{margin:0;background:#0f1115;color:#e8eaed}} a{{color:#8ab4f8}}</style>
+</head><body>{body}</body></html>"""
+
+
 def _snapshot_http_clients_stats() -> dict:
     by_port, ss_ok = _count_established_tcp_by_local_port()
-    c_nano = by_port.get(NANOTRACK_VIZ_PORT, 0)
-    c_light = by_port.get(LIGHTTRACK_VIZ_PORT, 0)
-    c_nano_ui = by_port.get(NANOTRACK_UI_PORT, 0)
-    c_light_ui = by_port.get(LIGHTTRACK_UI_PORT, 0)
+    active = _detect_active_tracker()
+    ports = _ports_for_backend(active.get("backend"))
+    viz = int(ports.get("viz", 0))
+    ui = int(ports.get("ui", 0))
+    c_viz = by_port.get(viz, 0) if viz else 0
+    c_ui = by_port.get(ui, 0) if ui else 0
     c_stats = by_port.get(STATS_WEB_PORT, 0)
+
+    # Also report well-known MJPEG/UI ports so dashboard shows occupancy.
+    known_viz = sorted({p["viz"] for p in _BACKEND_PORTS.values()})
+    known_ui = sorted({p["ui"] for p in _BACKEND_PORTS.values()})
+    by_viz = {p: by_port.get(p, 0) for p in known_viz if by_port.get(p, 0)}
+    by_ui = {p: by_port.get(p, 0) for p in known_ui if by_port.get(p, 0)}
+
     return {
-        "mjpeg_nano": c_nano,
-        "mjpeg_nano_port": NANOTRACK_VIZ_PORT,
-        "mjpeg_light": c_light,
-        "mjpeg_light_port": LIGHTTRACK_VIZ_PORT,
-        "ui_nano": c_nano_ui,
-        "ui_nano_port": NANOTRACK_UI_PORT,
-        "ui_light": c_light_ui,
-        "ui_light_port": LIGHTTRACK_UI_PORT,
+        "active_backend": active.get("backend"),
+        "mjpeg": c_viz,
+        "mjpeg_port": viz,
+        "ui": c_ui,
+        "ui_port": ui,
         "stats": c_stats,
         "stats_port": STATS_WEB_PORT,
-        "video_total": c_nano + c_light,
-        "web_total": c_nano + c_light + c_nano_ui + c_light_ui + c_stats,
+        "video_total": c_viz,
+        "web_total": c_viz + c_ui + c_stats,
+        "by_viz_port": by_viz,
+        "by_ui_port": by_ui,
         "ss_available": ss_ok,
+        # legacy keys for older dashboards / scripts
+        "mjpeg_nano": by_port.get(5003, 0),
+        "mjpeg_nano_port": 5003,
+        "mjpeg_light": by_port.get(5005, 0),
+        "mjpeg_light_port": 5005,
+        "ui_nano": by_port.get(5004, 0),
+        "ui_nano_port": 5004,
+        "ui_light": by_port.get(5006, 0),
+        "ui_light_port": 5006,
     }
 
 
@@ -492,6 +653,12 @@ def _ingest_telem_packet(raw: str) -> None:
 
 def _telem_listener_thread() -> None:
     global _telem_bind_ok, _telem_bind_error
+    if STATS_SKIP_UDP:
+        _telem_bind_ok = False
+        _telem_bind_error = "STATS_SKIP_UDP=1 (msp owns telem)"
+        print(f"[stats_web] UDP skipped — polling {BF_TELEM_FILE}", flush=True)
+        _telem_file_poll_loop()
+        return
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -506,16 +673,18 @@ def _telem_listener_thread() -> None:
         _telem_bind_ok = False
         _telem_bind_error = str(e)
         print(
-            f"[stats_web] UDP :{VISION_TELEMETRY_PORT} busy ({e}) — process stats only",
+            f"[stats_web] UDP :{VISION_TELEMETRY_PORT} busy ({e}) — using {BF_TELEM_FILE}",
             flush=True,
         )
         sock.close()
+        _telem_file_poll_loop()
         return
     sock.settimeout(1.0)
     while True:
         try:
             data, _addr = sock.recvfrom(4096)
         except socket.timeout:
+            _ingest_telem_file_once()
             continue
         except OSError:
             break
@@ -523,6 +692,75 @@ def _telem_listener_thread() -> None:
             _ingest_telem_packet(data.decode("utf-8", errors="replace").strip())
         except Exception:
             continue
+
+
+def _ingest_telem_file_once() -> None:
+    try:
+        with open(BF_TELEM_FILE, "r", encoding="utf-8") as f:
+            snap = json.load(f)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return
+    if not isinstance(snap, dict):
+        return
+    # Prefer tracker block from msp_betaflight snapshot
+    tr = snap.get("tracker") if isinstance(snap.get("tracker"), dict) else snap
+    fake = {
+        "tracker": tr.get("name") or snap.get("tracker_name"),
+        "cam": tr.get("cam") or snap.get("cam"),
+        "bbox_norm": tr.get("bbox_norm") or snap.get("bbox_norm"),
+        "conf": tr.get("conf") or snap.get("conf"),
+        "score": tr.get("score") or snap.get("score"),
+        "fps": tr.get("fps") or snap.get("fps"),
+        "tracking": tr.get("tracking") if "tracking" in tr else snap.get("tracking"),
+        "alive": True if (tr.get("alive_age_s") is not None and float(tr.get("alive_age_s") or 99) < 3) else None,
+        "cx": tr.get("cx"),
+        "cy": tr.get("cy"),
+        "h": tr.get("h"),
+    }
+    # Preserve timestamps from file when present
+    now = time.time()
+    with _telem_lock:
+        if snap.get("bbox_ts"):
+            _telem["bbox_ts"] = float(snap["bbox_ts"])
+        if snap.get("alive_ts"):
+            _telem["alive_ts"] = float(snap["alive_ts"])
+        if snap.get("last_ts"):
+            _telem["last_ts"] = float(snap["last_ts"])
+        if snap.get("lost_ts"):
+            _telem["lost_ts"] = float(snap["lost_ts"])
+        if snap.get("packets") is not None:
+            _telem["packets"] = int(snap["packets"])
+        _telem["_bf_snap"] = {
+            "msp": snap.get("msp"),
+            "rc": snap.get("rc"),
+            "fc": snap.get("fc"),
+            "file_age_s": now - float(snap.get("now_ts") or now),
+        }
+    if fake.get("bbox_norm") or fake.get("tracker") or fake.get("fps") is not None:
+        # Don't double-count packets via _ingest; update fields directly
+        with _telem_lock:
+            if fake.get("tracker"):
+                _telem["tracker"] = fake["tracker"]
+            if fake.get("cam"):
+                _telem["cam"] = fake["cam"]
+            if fake.get("bbox_norm"):
+                _telem["bbox_norm"] = fake["bbox_norm"]
+                if not snap.get("bbox_ts"):
+                    _telem["bbox_ts"] = now
+                _telem["tracking"] = True
+            if fake.get("tracking") is not None:
+                _telem["tracking"] = bool(fake["tracking"])
+            for key in ("conf", "fps", "cx", "cy", "h", "score"):
+                if fake.get(key) is not None:
+                    _telem[key] = fake[key]
+            if not snap.get("last_ts"):
+                _telem["last_ts"] = now
+
+
+def _telem_file_poll_loop() -> None:
+    while True:
+        _ingest_telem_file_once()
+        time.sleep(0.05)
 
 
 def _shm_cameras_present() -> list[str]:
@@ -546,21 +784,22 @@ def _tracker_snapshot(now_ts: float) -> dict:
     bbox_age = float(now_ts - t["bbox_ts"]) if t.get("bbox_ts") else -1.0
     telem_age = float(now_ts - t["last_ts"]) if t.get("last_ts") else -1.0
     lost_age = float(now_ts - t["lost_ts"]) if t.get("lost_ts") else -1.0
-    name = t.get("tracker")
-    nano_pids = _find_pids_by_cmd_keyword("nanotrack_fc")
-    light_pids = _find_pids_by_cmd_keyword("lighttrack_fc")
-    active = "nanotrack" if nano_pids else ("lighttrack" if light_pids else name)
-    pid = None
-    if active == "nanotrack" and nano_pids:
-        pid = nano_pids[0]
-    elif active == "lighttrack" and light_pids:
-        pid = light_pids[0]
+
+    active = _detect_active_tracker()
+    backend = (t.get("tracker") or active.get("backend") or "").lower() or None
+    if active.get("backend"):
+        backend = active["backend"]
+    ports = _ports_for_backend(backend)
+    pid = active.get("pid")
     metrics = _ps_metrics_for_pids([pid]) if pid else {}
     m = metrics.get(pid, {}) if pid else {}
     tracking = bool(t.get("tracking")) and bbox_age >= 0 and bbox_age < 1.5
+    running = bool(pid)
+
     return {
-        "name": active,
-        "running": bool(nano_pids or light_pids),
+        "name": backend,
+        "binary": active.get("binary"),
+        "running": running,
         "pid": pid,
         "cpu_pct": m.get("cpu_pct"),
         "rss_mb": m.get("rss_mb"),
@@ -583,12 +822,79 @@ def _tracker_snapshot(now_ts: float) -> dict:
         "telem_age_s": telem_age,
         "lost_age_s": lost_age,
         "packets": int(t.get("packets") or 0),
-        "cmd_port": NANOTRACK_CMD_PORT if active == "nanotrack" else LIGHTTRACK_CMD_PORT,
-        "viz_port": NANOTRACK_VIZ_PORT if active == "nanotrack" else LIGHTTRACK_VIZ_PORT,
-        "ui_port": NANOTRACK_UI_PORT if active == "nanotrack" else LIGHTTRACK_UI_PORT,
-        "nano_running": bool(nano_pids),
-        "light_running": bool(light_pids),
+        "cmd_port": ports.get("cmd"),
+        "viz_port": ports.get("viz"),
+        "ui_port": ports.get("ui"),
+        "available_backends": list(_AVAILABLE_BACKENDS),
+        "multi_running": bool(_find_pids_by_cmd_keyword("multitrack_fc")),
+        "nano_running": bool(_find_pids_by_cmd_keyword("nanotrack_fc")),
+        "light_running": bool(_find_pids_by_cmd_keyword("lighttrack_fc")),
     }
+
+
+def _betaflight_snapshot() -> dict:
+    with _telem_lock:
+        bf = dict(_telem.get("_bf_snap") or {})
+    pids = _find_pids_by_cmd_keyword("msp_betaflight.py")
+    metrics = _ps_metrics_for_pids(pids[:1]) if pids else {}
+    m = metrics.get(pids[0], {}) if pids else {}
+    msp = bf.get("msp") if isinstance(bf.get("msp"), dict) else {}
+    rc = bf.get("rc") if isinstance(bf.get("rc"), dict) else {}
+    return {
+        "fc": "betaflight",
+        "protocol": "msp",
+        "running": bool(pids),
+        "pid": pids[0] if pids else None,
+        "cpu_pct": m.get("cpu_pct"),
+        "rss_mb": m.get("rss_mb"),
+        "msp": msp,
+        "rc": rc,
+        "file_age_s": bf.get("file_age_s"),
+        "telem_file": BF_TELEM_FILE,
+    }
+
+
+def _benchmark_snapshot() -> dict:
+    candidates = (
+        _glob_mod.glob("/tmp/*report*.csv") +
+        _glob_mod.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tracking", "*report*.csv")) +
+        _glob_mod.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tracking", "build", "*report*.csv"))
+    )
+    best = max(candidates, key=os.path.getmtime) if candidates else None
+    if best is None:
+        return {"available": False}
+    try:
+        mtime = os.path.getmtime(best)
+        age = time.time() - mtime
+        with open(best, "r") as f:
+            lines = [l.strip() for l in f if l.strip()]
+        if not lines:
+            return {"available": False, "file": best}
+        header = [h.strip() for h in lines[0].split(",")]
+        trackers = []
+        for line in lines[1:]:
+            vals = [v.strip() for v in line.split(",")]
+            if len(vals) != len(header):
+                continue
+            row = dict(zip(header, vals))
+            for k in ("mean_iou", "auc", "precision_20px", "fps", "latency_avg_ms", "robustness"):
+                try:
+                    row[k] = float(row[k])
+                except (ValueError, KeyError):
+                    row[k] = None
+            tracker_name = row.get("tracker", "?")
+            row["tracker"] = tracker_name
+            trackers.append(row)
+        trackers.sort(key=lambda r: -(r.get("auc") or 0))
+        return {
+            "available": True,
+            "file": best,
+            "age_s": round(age, 1),
+            "tracker_count": len(trackers),
+            "trackers": trackers,
+        }
+    except Exception as e:
+        return {"available": False, "file": best, "error": str(e)}
 
 
 def _build_stats_json_snapshot() -> bytes:
@@ -614,16 +920,15 @@ def _build_stats_json_snapshot() -> bytes:
             "shm_cameras": _shm_cameras_present(),
         },
         "tracker": _tracker_snapshot(now_ts),
+        "betaflight": _betaflight_snapshot(),
         "ports": {
             "stats": STATS_WEB_PORT,
             "telemetry_udp": VISION_TELEMETRY_PORT,
-            "nano_cmd": NANOTRACK_CMD_PORT,
-            "light_cmd": LIGHTTRACK_CMD_PORT,
-            "nano_mjpeg": NANOTRACK_VIZ_PORT,
-            "light_mjpeg": LIGHTTRACK_VIZ_PORT,
-            "nano_ui": NANOTRACK_UI_PORT,
-            "light_ui": LIGHTTRACK_UI_PORT,
+            "msp_uart": os.environ.get("BF_MSP_PORT", "/dev/ttyS4"),
+            "backends": {k: v for k, v in _BACKEND_PORTS.items()},
+            "listening": sorted(_listening_tcp_ports()),
         },
+        "env_tracker": (os.environ.get("TRACKER") or "").strip() or None,
     }
     temps = _read_linux_thermal_zones_c_cached()
     s["temperatures_c"] = temps
@@ -636,6 +941,10 @@ def _build_stats_json_snapshot() -> bytes:
         s["system"] = _snapshot_system_monitoring()
     except Exception as e:
         s["system"] = {"error": str(e)}
+    try:
+        s["benchmark"] = _benchmark_snapshot()
+    except Exception as e:
+        s["benchmark"] = {"error": str(e)}
     return json.dumps(s, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
@@ -682,6 +991,7 @@ def _dashboard_html() -> str:
   <p style="color:#9aa0a6;font-size:14px;">Порт {STATS_WEB_PORT} · опрос {STATS_WEB_POLL_MS} ms · <code>/stats.json</code></p>
   <div class="grid">
     <div class="card"><div class="k">Трекер</div><div class="v" id="tracker">-</div></div>
+    <div class="card"><div class="k">Betaflight MSP</div><div class="v" id="bf">-</div></div>
     <div class="card"><div class="k">Телеметрия / bbox</div><div class="v" id="telem">-</div></div>
     <div class="card"><div class="k">Orchestrator / SHM</div><div class="v" id="orch">-</div></div>
     <div class="card"><div class="k">Температуры</div><div class="v" id="temps">-</div></div>
@@ -689,6 +999,7 @@ def _dashboard_html() -> str:
     <div class="card"><div class="k">Память / нагрузка</div><div class="v" id="sysmem">-</div></div>
     <div class="card"><div class="k">Диски</div><div class="v" id="sysdisk">-</div></div>
     <div class="card"><div class="k">Процессы стека</div><div class="v" id="sysproc">-</div></div>
+    <div class="card"><div class="k">Benchmark</div><div class="v" id="benchmark">-</div></div>
     <div class="card"><div class="k">Порты</div><div class="v" id="ports">-</div></div>
   </div>
   <h3 style="margin-top:16px;">Raw JSON</h3>
@@ -704,22 +1015,68 @@ def _dashboard_html() -> str:
     function escapeHtml(str) {{
       return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }}
+    function httpLink(port, label, kind) {{
+      if (port == null || port === '' || !isFinite(Number(port))) return escapeHtml(String(label || port || '—'));
+      const p = Number(port);
+      const text = label != null ? label : (':' + p);
+      const live = window.__listenPorts && window.__listenPorts.has(p);
+      const title = live ? '' : 'порт не слушается';
+      const k = kind || 'mjpeg';
+      const href = '/view?port=' + p + '&kind=' + encodeURIComponent(k);
+      return '<a href="' + href + '" target="_blank" rel="noopener" title="' + title + '" style="' + (live ? '' : 'opacity:0.6') + '">' + escapeHtml(text) + '</a>';
+    }}
     async function tick() {{
       const r = await fetch('/stats.json', {{cache: 'no-store'}});
       const s = await r.json();
       document.getElementById('raw').textContent = JSON.stringify(s, null, 2);
+      window.__listenPorts = new Set((s.ports && s.ports.listening) || []);
+      // Always treat stats itself as live.
+      window.__listenPorts.add({STATS_WEB_PORT});
       const pa = {STATS_WEB_PREC_AGE};
       const tr = s.tracker || {{}};
       let trHtml = '';
       if (!tr.running) trHtml = badge('bad', 'не запущен');
       else if (tr.tracking) trHtml = badge('ok', 'tracking') + ' ' + badge('muted', escapeHtml(tr.name || '?'));
       else trHtml = badge('warn', 'ожидание цели') + ' ' + badge('muted', escapeHtml(tr.name || '?'));
-      if (tr.pid) trHtml += '<br/><small>pid ' + tr.pid + '</small>';
+      if (tr.pid) trHtml += '<br/><small>pid ' + tr.pid +
+        (tr.binary ? ' · ' + escapeHtml(tr.binary) : '') + '</small>';
+      if (tr.viz_port || tr.ui_port) {{
+        trHtml += '<br/>';
+        if (tr.viz_port) trHtml += httpLink(tr.viz_port, 'MJPEG :' + tr.viz_port, 'mjpeg');
+        if (tr.viz_port && tr.ui_port) trHtml += ' · ';
+        if (tr.ui_port) trHtml += httpLink(tr.ui_port, 'Capture :' + tr.ui_port, 'ui');
+      }}
+      if (tr.available_backends && tr.available_backends.length) {{
+        trHtml += '<br/><small>backends: ' + escapeHtml(tr.available_backends.join(', ')) + '</small>';
+      }}
       if (tr.fps != null) trHtml += '<br/><small>FPS ' + Number(tr.fps).toFixed(1) +
         ' · track ' + Number(tr.track_ms_avg ?? 0).toFixed(1) + '/' + Number(tr.track_ms_max ?? 0).toFixed(1) + ' ms</small>';
       if (tr.cpu_pct != null) trHtml += '<br/><small>CPU ' + Number(tr.cpu_pct).toFixed(1) +
         '% · RSS ' + Number(tr.rss_mb ?? 0).toFixed(0) + ' MB</small>';
+      if (tr.cmd_port) {{
+        trHtml += '<br/><br/>' +
+          '<button onclick="fetch(&quot;/cmd?action=init&quot;).then(r=&gt;r.text()).then(console.log).catch(console.error)" style="background:#2d7d46;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px;margin-right:4px">▶ Start</button>' +
+          '<button onclick="fetch(&quot;/cmd?action=stop&quot;).then(r=&gt;r.text()).then(console.log).catch(console.error)" style="background:#8a2e2e;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px">■ Stop</button>';
+      }}
       document.getElementById('tracker').innerHTML = trHtml;
+
+      const bf = s.betaflight || {{}};
+      let bfHtml = '';
+      if (!bf.running) bfHtml = badge('bad', 'msp_betaflight нет');
+      else bfHtml = badge('ok', 'MSP pid ' + bf.pid);
+      const msp = bf.msp || {{}};
+      const rc = bf.rc || {{}};
+      if (msp.ok) bfHtml += ' ' + badge('ok', 'UART');
+      else bfHtml += ' ' + badge('warn', msp.error || 'UART?');
+      if (rc.guidance) bfHtml += ' ' + badge('ok', 'guidance');
+      else bfHtml += ' ' + badge('muted', escapeHtml(String(rc.reason || 'mid')));
+      bfHtml += '<br/><small>port ' + escapeHtml(msp.port || s.ports?.msp_uart || '—') +
+        ' · map ' + escapeHtml(msp.map || 'aetr') +
+        ' · yaw ' + (rc.yaw != null ? rc.yaw : '—') +
+        ' · pitch ' + (rc.pitch != null ? rc.pitch : '—') + '</small>';
+      if (msp.guidance_enable) bfHtml += '<br/>' + badge('warn', 'GUIDANCE ON');
+      else bfHtml += '<br/>' + badge('muted', 'guidance off (safe)');
+      document.getElementById('bf').innerHTML = bfHtml;
 
       const listenOk = s.telem_listen && s.telem_listen.ok;
       let teHtml = listenOk ? badge('ok', 'UDP listen') : badge('warn', 'UDP offline');
@@ -767,14 +1124,20 @@ def _dashboard_html() -> str:
       else {{
         hHtml += badge(hc.video_total > 0 ? 'ok' : 'muted', 'видео ' + (hc.video_total ?? 0)) +
           ' ' + badge('muted', 'всего ' + (hc.web_total ?? 0)) + '<br/>';
-        [
-          ['MJPEG nano', hc.mjpeg_nano_port, hc.mjpeg_nano],
-          ['MJPEG light', hc.mjpeg_light_port, hc.mjpeg_light],
-          ['UI nano', hc.ui_nano_port, hc.ui_nano],
-          ['UI light', hc.ui_light_port, hc.ui_light],
-          ['stats', hc.stats_port, hc.stats],
-        ].forEach(function(row) {{
-          hHtml += '<small>' + escapeHtml(row[0]) + ' :' + row[1] + ' → ' + row[2] + '</small><br/>';
+        if (hc.mjpeg_port) {{
+          hHtml += '<small>MJPEG ' + httpLink(hc.mjpeg_port, ':' + hc.mjpeg_port, 'mjpeg') +
+            ' → ' + (hc.mjpeg ?? 0) + '</small><br/>';
+        }}
+        if (hc.ui_port) {{
+          hHtml += '<small>UI ' + httpLink(hc.ui_port, ':' + hc.ui_port, 'ui') +
+            ' → ' + (hc.ui ?? 0) + '</small><br/>';
+        }}
+        hHtml += '<small>stats ' + httpLink(hc.stats_port ?? {STATS_WEB_PORT}, ':' + (hc.stats_port ?? {STATS_WEB_PORT}), 'ui') +
+          ' → ' + (hc.stats ?? 0) + '</small><br/>';
+        const extra = Object.assign({{}}, hc.by_viz_port || {{}}, hc.by_ui_port || {{}});
+        Object.keys(extra).forEach(function(p) {{
+          const kind = (hc.by_ui_port && hc.by_ui_port[p] != null && !(hc.by_viz_port && hc.by_viz_port[p] != null)) ? 'ui' : 'mjpeg';
+          hHtml += '<small>port ' + httpLink(p, ':' + p, kind) + ' → ' + extra[p] + '</small><br/>';
         }});
       }}
       document.getElementById('httpcli').innerHTML = hHtml;
@@ -839,14 +1202,51 @@ def _dashboard_html() -> str:
 
       const ports = s.ports || {{}};
       let pHtml = '';
-      Object.keys(ports).forEach(function(k) {{
-        pHtml += '<small>' + escapeHtml(k) + ': ' + ports[k] + '</small><br/>';
-      }});
-      if (tr.viz_port) {{
-        pHtml += '<br/><a href="http://' + location.hostname + ':' + tr.viz_port + '/" target="_blank">MJPEG</a> · ';
-        pHtml += '<a href="http://' + location.hostname + ':' + tr.ui_port + '/" target="_blank">Capture UI</a>';
+      pHtml += '<small>stats: ' + httpLink(ports.stats, ':' + (ports.stats ?? ''), 'ui') + '</small><br/>';
+      pHtml += '<small>telem UDP: ' + escapeHtml(String(ports.telemetry_udp ?? '—')) + '</small><br/>';
+      pHtml += '<small>MSP: ' + escapeHtml(ports.msp_uart || '—') + '</small><br/>';
+      if (tr.viz_port || tr.ui_port) {{
+        pHtml += '<br/>';
+        if (tr.viz_port) pHtml += httpLink(tr.viz_port, 'MJPEG :' + tr.viz_port, 'mjpeg');
+        if (tr.viz_port && tr.ui_port) pHtml += ' · ';
+        if (tr.ui_port) pHtml += httpLink(tr.ui_port, 'Capture :' + tr.ui_port, 'ui');
+        if (tr.cmd_port) pHtml += '<br/><small>cmd UDP :' + escapeHtml(String(tr.cmd_port)) + '</small>';
+      }}
+      const be = ports.backends || {{}};
+      const keys = Object.keys(be).sort();
+      if (keys.length) {{
+        pHtml += '<br/><br/><small>бэкенды (синие = порт живой):</small><br/>';
+        keys.forEach(function(k) {{
+          const v = be[k] || {{}};
+          const active = (tr.name && String(tr.name).toLowerCase() === String(k).toLowerCase());
+          pHtml += '<small>' + (active ? '<b>' + escapeHtml(k) + '</b>' : escapeHtml(k)) + ' → ';
+          pHtml += httpLink(v.viz, ':' + v.viz, 'mjpeg') + ' / ' + httpLink(v.ui, ':' + v.ui, 'ui');
+          pHtml += '</small><br/>';
+        }});
       }}
       document.getElementById('ports').innerHTML = pHtml || badge('muted', '—');
+
+      const bm = s.benchmark || {{}};
+      let bmHtml = '';
+      if (bm.error) {{
+        bmHtml = badge('warn', 'ошибка') + '<br/><small>' + escapeHtml(bm.error) + '</small>';
+      }} else if (!bm.available) {{
+        bmHtml = badge('muted', 'нет данных');
+      }} else {{
+        bmHtml += badge('ok', bm.tracker_count + ' трекеров') + ' <small>age ' + ageStr(bm.age_s, 1) + '</small><br/>';
+        (bm.trackers || []).slice(0, 8).forEach(function(t, i) {{
+          const auc = t.auc != null ? Number(t.auc).toFixed(3) : '—';
+          const fps = t.fps != null ? Number(t.fps).toFixed(0) : '—';
+          const lat = t.latency_avg_ms != null ? Number(t.latency_avg_ms).toFixed(0) + 'ms' : '—';
+          const iou = t.mean_iou != null ? Number(t.mean_iou).toFixed(3) : '—';
+          const cls = i === 0 ? ' style="color:#a6e3a1"' : '';
+          bmHtml += '<small' + cls + '>' + escapeHtml(t.tracker) + ': IoU=' + iou + ' AUC=' + auc + ' FPS=' + fps + ' ' + lat + '</small><br/>';
+        }});
+        if (bm.trackers && bm.trackers.length > 8) {{
+          bmHtml += '<small style="color:#9aa0a6">+ ещё ' + (bm.trackers.length - 8) + '...</small>';
+        }}
+      }}
+      document.getElementById('benchmark').innerHTML = bmHtml;
     }}
     setInterval(() => tick().catch(()=>{{}}), {STATS_WEB_POLL_MS});
     tick();
@@ -881,14 +1281,88 @@ def run_server() -> None:
         def do_GET(self) -> None:  # noqa: N802
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path or "/"
+            qs = urllib.parse.parse_qs(parsed.query or "")
             if path in ("/stats", "/stats.json"):
                 return self._send(200, "application/json; charset=utf-8", _stats_json_body_cached())
             if path in ("/", "/index.html"):
                 html = _dashboard_html().encode("utf-8")
                 return self._send(200, "text/html; charset=utf-8", html)
+            if path in ("/view", "/open"):
+                try:
+                    port = int((qs.get("port") or ["0"])[0])
+                except ValueError:
+                    port = 0
+                kind = ((qs.get("kind") or ["mjpeg"])[0] or "mjpeg").lower()
+                if kind not in ("mjpeg", "ui"):
+                    kind = "mjpeg"
+                if port < 1 or port > 65535:
+                    return self._send(400, "text/plain; charset=utf-8", b"bad port\n")
+                live = _listening_tcp_ports()
+                if port not in live and port != STATS_WEB_PORT:
+                    msg = f"port {port} is not listening\n".encode()
+                    return self._send(503, "text/plain; charset=utf-8", msg)
+                html = _stream_viewer_html(port, kind).encode("utf-8")
+                return self._send(200, "text/html; charset=utf-8", html)
             if path in ("/health", "/healthz"):
                 body = b'{"ok":true}\n'
                 return self._send(200, "application/json; charset=utf-8", body)
+            if path == "/cmd":
+                action = (qs.get("action") or [""])[0]
+                backend = (qs.get("backend") or ["light"])[0].lower()
+                if action not in ("init", "stop"):
+                    return self._send(400, "text/plain; charset=utf-8", b"bad action\n")
+                ts = _tracker_snapshot(time.time())
+                running = ts.get("running", False)
+                if action == "init":
+                    if running:
+                        # Already running — send UDP re-init
+                        port = ts.get("cmd_port")
+                        if port:
+                            try:
+                                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                                sock.settimeout(1.0)
+                                sock.sendto(b'{"cmd":"init","bbox_norm":[0.5,0.5,0.2,0.2]}', ("127.0.0.1", port))
+                                sock.close()
+                            except OSError:
+                                pass
+                        return self._send(200, "text/plain; charset=utf-8", b"tracker already running, sent re-init\n")
+                    # Launch tracker binary
+                    binary_map = {
+                        "light": ("lighttrack_fc", "/root/drone-tracking/tracking/build/lighttrack_fc",
+                                   "--camera", "/dev/cam_usb2", "--models", "/root/drone-tracking/tracking/models/lighttrack",
+                                   "--cmd-port", "12349", "--viz-port", "5005"),
+                        "nano": ("lighttrack_fc", "/root/drone-tracking/tracking/build/multitrack_fc",
+                                 "--backend", "nano",
+                                 "--camera", "/dev/cam_usb2", "--models", "/root/drone-tracking/tracking/models",
+                                 "--cmd-port", "12347", "--viz-port", "5003"),
+                        "nanov3": ("lighttrack_fc", "/root/drone-tracking/tracking/build/multitrack_fc",
+                                   "--backend", "nanov3",
+                                   "--camera", "/dev/cam_usb2", "--models", "/root/drone-tracking/tracking/models/nanotrackv3",
+                                   "--cmd-port", "12351", "--viz-port", "5007"),
+                    }
+                    info = binary_map.get(backend, binary_map["light"])
+                    cmd_args = list(info[1:])
+                    try:
+                        subprocess.Popen(
+                            cmd_args,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            cwd="/root/drone-tracking/tracking/build",
+                            start_new_session=True,
+                        )
+                        return self._send(200, "text/plain; charset=utf-8", f"launched {backend}\n".encode())
+                    except OSError as e:
+                        return self._send(500, "text/plain; charset=utf-8", f"launch failed: {e}\n".encode())
+                # action == "stop"
+                if not running:
+                    return self._send(200, "text/plain; charset=utf-8", b"tracker not running\n")
+                pid = ts.get("pid")
+                if pid:
+                    try:
+                        os.kill(pid, 15)  # SIGTERM
+                    except OSError:
+                        pass
+                return self._send(200, "text/plain; charset=utf-8", b"stopped\n")
             return self._send(404, "text/plain; charset=utf-8", b"Not found\n")
 
     class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):

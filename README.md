@@ -1,8 +1,8 @@
 # drone-tracking
 
-Standalone visual object tracking for Orange Pi / RK3588.
+Visual object tracking for Orange Pi / RK3588 + **Betaflight** (MSP), not ArduPilot/MAVLink.
 
-**Only tracking.** No YOLO. No optical flow. No flight controller.
+**No YOLO. No optical flow. No MAVLink.** Tracker → UDP bbox → `msp_betaflight.py` / `chase_fc` → UART MSP `SET_RAW_RC`.
 
 ## Contents
 
@@ -12,7 +12,7 @@ Standalone visual object tracking for Orange Pi / RK3588.
 | `orchestrator/` | V4L2 → shared-memory camera frames |
 | `control/` | `chase_fc` (CRSF→MSP) + `osd_overlay` |
 | `tracking/models/` | NCNN `.param` / `.bin` weights |
-| `deploy/` | On-drone start scripts, `chase.json`, stats `:8090` |
+| `deploy/` | Start scripts, systemd, `chase.json`, stats `:8090`, **MSP Betaflight** |
 | `reference/rpi_interceptor/` | Recovered old RPi system (app, config, unlock) |
 
 ## Dependencies
@@ -20,7 +20,7 @@ Standalone visual object tracking for Orange Pi / RK3588.
 - OpenCV
 - [ncnn](https://github.com/Tencent/ncnn) (default install path: `/root/ncnn-install`)
 - pthread, rt
-- Python 3 (only for `deploy/stats_web.py`)
+- Python 3 + `pyserial` (`pip3 install pyserial`) for MSP UART
 
 Override ncnn path in `tracking/CMakeLists.txt` (`NCNN_DIR`) if needed.
 
@@ -38,7 +38,21 @@ cd orchestrator && ./build.sh
 cd ../tracking && ./build.sh
 ```
 
-Binaries: `tracking/build/nanotrack_fc`, `tracking/build/lighttrack_fc`, `orchestrator/build/orch_daemon`.
+Binaries: `tracking/build/nanotrack_fc`, `tracking/build/lighttrack_fc`, `tracking/build/multitrack_fc`, `orchestrator/build/orch_daemon`.
+
+## Trackers (`TRACKER=…`)
+
+| TRACKER | Notes | UI |
+|---------|-------|-----|
+| `nano` / `light` | NCNN production | :5004 / :5006 |
+| `nanov3` | NanoTrack V3 ONNX | :5008 |
+| `csrt` `kcf` `mosse` `mil` `medianflow` `tld` | OpenCV classical | :5011+ |
+| `dasiamrpn` `goturn` | OpenCV DNN (fetch models) | :5023 / :5025 |
+| `cftrack` | KCF+CSRT ensemble | :5027 |
+| `tctrack` | NanoV3 + template refresh | :5029 |
+| `vit`/`ostrack`/`mixformer` | needs OpenCV ≥4.8 | :5031 |
+
+See `tracking/models/COMPARE.md`. Stats: http://\<IP\>:8090/
 
 ## Deploy / run on drone
 
@@ -46,6 +60,12 @@ Binaries: `tracking/build/nanotrack_fc`, `tracking/build/lighttrack_fc`, `orches
 cd /root/drone-tracking/deploy
 TRACKER=light ./start_tracking.sh restart   # or TRACKER=nano
 ./start_tracking.sh status
+
+# Enable stick output (after BF Ports/Modes configured):
+BF_GUIDANCE_ENABLE=1 ./start_tracking.sh restart
+
+# Optional interceptor chase (CRSF→MSP) + OSD:
+DRON_ENABLE_CHASE=1 DRON_ENABLE_OSD=1 OSD_SINK=/dev/video10 ./start_tracking.sh restart
 ```
 
 systemd:
@@ -68,6 +88,40 @@ Dashboard + JSON (same idea as perehvatchik FC stats):
 
 Env: `STATS_WEB_PORT`, `STATS_WEB_POLL_MS`, `STATS_WEB_JSON_CACHE_MS`, `VISION_TELEMETRY_PORT`.
 
+### MJPEG preview (default ~30 FPS, low CPU)
+
+Tracker runs at full camera resolution; the browser preview is downscaled JPEG:
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `VISION_MJPEG_PERIOD_MS` | `33` | ~30 FPS encode cadence |
+| `VISION_MJPEG_QUALITY` | `40` | JPEG quality |
+| `VISION_STREAM_MAX_W` | `480` | max preview width (`0` = full) |
+
+Full-res preview: `VISION_STREAM_MAX_W=0`. Lower CPU further: `VISION_STREAM_MAX_W=320`.
+
+## Betaflight (MSP) — replaces MAVLink
+
+```text
+orch → tracker → UDP :12345 → msp_betaflight.py → /dev/ttyS4 MSP → Betaflight
+                              ↘ /dev/shm/drone_telem.json → stats :8090
+```
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `BF_MSP_ENABLE` | `1` | start MSP companion |
+| `BF_MSP_PORT` | `/dev/ttyS4` | UART to BF (Ports tab → MSP) |
+| `BF_MSP_BAUD` | `115200` | |
+| `BF_MSP_HZ` | `50` | `SET_RAW_RC` rate |
+| `BF_MAP` | `aetr` | channel order |
+| `BF_GUIDANCE_ENABLE` | `0` | `1` = yaw/pitch from bbox (safe off by default) |
+| `BF_ARM_ENABLE` | `0` | `1` = raise AUX arm when guiding |
+| `BF_AUX_ARM_CH` | `5` | AUX channel index (1-based) |
+
+**BF Configurator:** enable MSP on the UART wired to the Orange Pi; set Mode for MSP Override / Angle as needed; keep ELRS on a **different** UART. Failsafe must return control to RX if companion dies.
+
+Guidance stays mid-sticks until `BF_GUIDANCE_ENABLE=1` and a fresh bbox arrives.
+
 ## Manual run (debug)
 
 ```bash
@@ -81,6 +135,7 @@ Env: `STATS_WEB_PORT`, `STATS_WEB_POLL_MS`, `STATS_WEB_JSON_CACHE_MS`, `VISION_T
   --camera /dev/cam_usb2 \
   --models ./tracking/models
 
+python3 deploy/msp_betaflight.py   # owns :12345 → MSP UART
 python3 deploy/stats_web.py
 ```
 
@@ -97,22 +152,22 @@ echo '{"cmd":"reset"}' > /dev/udp/127.0.0.1/12349
 echo '{"cmd":"init","bbox_norm":[0.5,0.5,0.2,0.2]}' > /dev/udp/127.0.0.1/12347
 ```
 
-Telemetry → `:12345` (bbox + 1 Hz heartbeat with FPS / track_ms):
+Telemetry → `:12345` → **msp_betaflight** (bbox + heartbeat):
 
 ```json
 {"cam":"front","tracker":"lighttrack","bbox_norm":[0.51,0.48,0.12,0.10],"class_id":0,"conf":1.0}
-{"tracker":"lighttrack","cam":"front","alive":true,"tracking":true,"fps":28.5,"track_ms_avg":12.1,...}
 ```
 
-| Binary | Cmd port | MJPEG | Capture UI |
-|--------|----------|-------|------------|
-| `nanotrack_fc` | 12347 | 5003 | 5004 |
-| `lighttrack_fc` | 12349 | 5005 | 5006 |
-| `stats_web.py` | — | — | **8090** |
+| Binary | Cmd / role |
+|--------|------------|
+| `nanotrack_fc` | cmd :12347 · MJPEG :5003 · UI :5004 |
+| `lighttrack_fc` | cmd :12349 · MJPEG :5005 · UI :5006 |
+| `msp_betaflight.py` | UDP :12345 → MSP UART (Betaflight) |
+| `stats_web.py` | HTTP **:8090** |
 
 ## Contract
 
 1. Frames from orchestrator SHM (`/dev/shm/drone_cam_*`)
 2. Target seed via UDP `init` / `reset` only
-3. Output: UDP bbox JSON with `"tracker":"nanotrack"|"lighttrack"`
+3. Output: UDP bbox JSON → Betaflight MSP `SET_RAW_RC` (not MAVLink)
 4. Ops visibility: HTTP stats on `:8090`
